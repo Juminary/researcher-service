@@ -119,3 +119,10 @@ export function isTextMimeType(mimeType: string): boolean {
     mimeType === 'image/svg+xml'
   )
 }
+
+// write 面 content → bytes 解码（二进制 mime 视 content 为 base64——对齐官方
+// FilesystemBackend 的 write 分支）。基类与 JournalingBackend 装饰器同源调用：
+// 写坏字节与否的关键语义，单点钉死防双处漂移。
+export function decodeWriteContent(filePath: string, content: string): Buffer {
+  return isTextMimeType(getMimeType(filePath)) ? Buffer.from(content, 'utf8') : Buffer.from(content, 'base64')
+}

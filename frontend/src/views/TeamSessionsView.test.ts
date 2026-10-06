@@ -22,7 +22,7 @@ describe('#786 session REST/SSE journey', () => {
       id: 'peer', name: 'Reader', task: 'Find evidence', status: finished ? 'completed' : 'running', mailbox: [],
       messages: finished ? [{ id: 'result', role: 'assistant', turn: 1, content: 'Peer result', createdAt: '', anchorCheckpointId: null }] : [],
     }] })
-    vi.stubGlobal('fetch', vi.fn(async (input: string) => new Response(JSON.stringify({ code: 0, message: '', data: input.endsWith('/messages') ? projection() : [{ id: 'session', title: 'Research' }] }), { headers: { 'Content-Type': 'application/json' } })))
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => new Response(JSON.stringify({ code: 0, message: '', data: input.endsWith('/messages') ? projection() : { sessions: [{ id: 'session', title: 'Research', createdAt: '', updatedAt: '' }] } }), { headers: { 'Content-Type': 'application/json' } })))
     vi.stubGlobal('EventSource', Stream)
     const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/sessions/:id?', component: TeamSessionsView }] })
     await router.push('/sessions/session'); await router.isReady()

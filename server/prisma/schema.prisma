@@ -343,6 +343,11 @@ model Session {
   // 旧分支自然保留（checkpoint 树即分支真相源）。
   activeCheckpointId String?
 
+  // 文件 rewind 水位（#782 · D8）：锚点时刻的 journal 最大 seq。逆放集 = seq > 水位 ∧
+  // 行未处置（fileRevertedAt null）；崩溃续放判据（残集非空 → 续放，逆放幂等）。
+  // scope=chat（只回对话文件保持现状）= 水位推进至当前 max（处置面永久跳过）。
+  fileJournalAnchorSeq Int?
+
   // #787: /model is a session preference, applied at the next run snapshot.
   preferredModelJson String?
 
@@ -705,10 +710,15 @@ model FileJournal {
   afterSha256  String? // 后像 sha256（delete 无后像 → null）
   tombstoneKey String? // 墓碑 key（daemon 侧 root 写 0700 隐藏目录；非墓碑行 null）
   toolCallId   String // 幂等键（journal-first 崩溃去重）
+  // 打点所在 run（checkpointId 回填键：终态 recordTurn 按 runId 精确回填 anchorCheckpointId
+  // ——'' 哨兵按会话回填会误伤并发 thread 的新 pending 行；runId 面无并发污染）。
+  runId        String?
   applied      Boolean @default(false)
-  // #770 rewind 软删：checkpointId 落在被放弃路线的行打标记（rewind 逆放跳过 = 幂等 no-op，
-  // #782 消费；fork 继承只拷活跃行）。
+  // #770 rewind 软删：checkpointId 落在被放弃路线的行打标记（投影/继承面；fork 继承只拷活跃行）。
   archivedAt DateTime?
+  // #782 行级处置标记：文件效果已处置（逆放完成 或 scope=chat 保持现状水位越过）。逆放集 =
+  // seq > session.fileJournalAnchorSeq ∧ 本列 null；崩溃续放按同一判据（逆放幂等）。
+  fileRevertedAt DateTime?
 
   @@unique([sessionId, seq])
   @@unique([sessionId, toolCallId])

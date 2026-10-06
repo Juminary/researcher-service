@@ -1,10 +1,9 @@
 <script setup lang="ts">
-// T06 权限审批卡（spec §9.4）：橙边待处理，处理后变淡显示结果。props-in/emits-out 哑组件
-// （#316：#340 拆分边界）；resolve 由父注入（#399 起并入 ChatStream 合并时间线渲染）。
-// #405-T3（#408）：subagent 审批卡带来源徽标（agentId 主显示，缺失降级「subagent」），
-// main 审批无徽标；纯表现，不动状态机。
+// T06 权限审批卡（#783 三层漏斗升级通道前端面 / #729）：橙边待处理，处理后落定即摘除
+//（ADR 0014，摘除在父层）。props-in/emits-out 哑组件（#316：#340 拆分边界）。
+// decision 两值：allow（放行一次）/ deny——allow-always 已砍（#729 钉死）。
+// #793：teammate 审批带「队友协作」徽标（teammateId 非空；具名折叠区泛化归 #796）。
 import type { ApprovalItem } from '@/stores/chat'
-import { isSubagentApproval } from '@/chat/subagentApproval'
 
 defineProps<{
   approval: ApprovalItem
@@ -12,43 +11,24 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
-  resolve: [approval: ApprovalItem, decision: 'allow-once' | 'deny']
+  resolve: [approval: ApprovalItem, decision: 'allow' | 'deny']
   toggleDetail: [approval: ApprovalItem]
 }>()
 
-// 徽标文本：agentId 非空显示发起 subagent 的 agentId；缺失（sessionKey 形态判定的 subagent 卡）
-// 降级「subagent」泛化文案（#396 Q2 定案）。|| 与 isSubagentApproval 门控同为 truthy 判定——
-// 空串 ''（防御值）也走降级，不渲染空徽标。
-function sourceBadgeText(a: ApprovalItem): string {
-  return a.agentId || 'subagent'
-}
-
-// 审批卡副标题（说明 agent 请求执行 elevated 命令）
+// 审批卡副标题（升级通道：工具执行被漏斗升级，需用户裁决）
 function approvalSubtitle(a: ApprovalItem): string {
-  return `${a.kind ?? 'exec'} agent 请求执行一条 elevated 命令，请确认后批准或拒绝：`
+  return `agent 请求执行 ${a.toolName}，请确认后批准或拒绝：`
 }
 
-function resolvedTagText(a: ApprovalItem): string {
-  return a.decision === 'allow-once'
-    ? '已批准'
-    : a.decision === 'allow-always'
-      ? '已批准（始终）'
-      : a.decision === 'deny'
-        ? '已拒绝'
-        : '未知'
-}
 function commandSummary(command: string): string { return command.replace(/\s+/g, ' ').slice(0, 120) }
 </script>
 
 <template>
-  <div class="approval" :class="{ resolved: approval.status === 'resolved' }" :data-test="`approval-${approval.id}`">
+  <div class="approval" :data-test="`approval-${approval.id}`">
     <div class="a-head">
       ⚠️ 请求提升权限
-      <span v-if="isSubagentApproval(approval)" class="source-badge" data-test="approval-source">
-        <span class="source-dot" />{{ sourceBadgeText(approval) }}
-      </span>
-      <span v-if="approval.status === 'resolved'" class="resolved-tag" :class="approval.decision">
-        {{ resolvedTagText(approval) }}
+      <span v-if="approval.teammateId" class="source-badge" data-test="approval-source">
+        <span class="source-dot" />队友协作
       </span>
       <!-- #492：网关侧审批已失效（过期/他端处理）→ 终态不可回覆，明示「已失效」而非死卡 -->
       <span v-if="approval.status === 'expired'" class="resolved-tag expired" data-test="approval-expired">
@@ -56,19 +36,20 @@ function commandSummary(command: string): string { return command.replace(/\s+/g
       </span>
     </div>
     <div class="a-sub">{{ approvalSubtitle(approval) }}</div>
-    <div class="a-cmd" :title="approval.command">{{ commandSummary(approval.command) }}</div>
+    <div class="a-cmd" :title="approval.toolCallSummary">{{ commandSummary(approval.toolCallSummary) }}</div>
     <div v-if="approval.detailOpen" class="a-detail" :data-test="`approval-detail-${approval.id}`">
-      命令全文：<code>{{ approval.command }}</code><br>
-      审批 id：<code>{{ approval.id }}</code> · 类型：<code>{{ approval.kind }}</code>
-      · 经审批事件推送，审批接口回覆
+      参数摘要全文：<code>{{ approval.toolCallSummary }}</code><br>
+      升级来源：<code>{{ approval.source }}</code>
+      <template v-if="approval.judgeReason"> · judge 理由：<code>{{ approval.judgeReason }}</code></template>
+      <br>审批 id：<code>{{ approval.id }}</code> · 经审批事件推送，审批接口回覆
     </div>
-    <div v-if="approval.status !== 'resolved' && approval.status !== 'expired'" class="a-actions">
+    <div v-if="approval.status !== 'expired'" class="a-actions">
       <button
         class="btn-approve"
         :disabled="approval.status !== 'pending' || disconnected"
         :title="disconnected ? '连接已断开，请重新连接后操作' : '仅批准本次操作'"
         :data-test="`approve-${approval.id}`"
-        @click="emit('resolve', approval, 'allow-once')"
+        @click="emit('resolve', approval, 'allow')"
       >{{ approval.status === 'resolving' ? '处理中…' : '批准一次' }}</button>
       <button
         class="btn-deny"

@@ -12,3 +12,9 @@ export const TITLE_MAX = 200
 
 // 自动生成标题截断（story 5：首条用户消息前缀派生）。
 export const TITLE_AUTO_MAX = 30
+
+// 恢复菜单三态（#747 UX · #782）：all = 对话+文件同回（缺省）；chat = 只回对话（文件保持
+// 现状永久化——水位推进）；files = 只回文件（对话面零改动）。单点派生（对齐 JOURNAL_OPS
+// 先例）：zod schema 与 RewindScope 类型同源，防双处手写漂移。
+export const REWIND_SCOPES = ['all', 'chat', 'files'] as const
+export type RewindScope = (typeof REWIND_SCOPES)[number]

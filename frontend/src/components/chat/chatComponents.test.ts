@@ -1,7 +1,8 @@
 // seam: chat 展示组件哑测（#316 / #340 验收：props-in/emits-out 零逻辑，贴 FileTree 测试形态）。
-// 覆盖：ChatSidebar 容器/会话渲染 + emits；ChatComposer 输入 v-model + 发送禁用门 + slash-menu slot；
-// ChatMessageItem thinking/tool-line slot 透传 + 光标；ApprovalCard resolve emits + 已解决态；
-// ChatStream 消息流渲染 + 自动滚动（ADR 0014 审批卡撤离时间线；#400 范式 B + rAF 节流）。
+// #793 chat 核心重写：ChatSidebar 会话扁平列表（容器维度退役）；ChatMessageItem 媒体换 MediaRef
+// 文件卡；ApprovalCard 换 #783 升级通道形状（allow/deny 两值，teammate 徽标）；回退/fork 身份门
+// entryId → 消息行 id。ChatComposer/ChatStream/TraceFold/AnchorRail 骨架不变。
+/// <reference types="node" />
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { nextTick, reactive } from 'vue'
@@ -16,17 +17,7 @@ import ApprovalDock from '@/components/chat/ApprovalDock.vue'
 import ChatStream from '@/components/chat/ChatStream.vue'
 import AnchorRail from '@/components/chat/AnchorRail.vue'
 
-const INSTANCE = {
-  name: 'demo',
-  port: 19000,
-  status: 'running',
-  health: 'healthy',
-  image: 'i',
-  container_id: 'c',
-  created_at: '',
-  pairing: { status: 'unpaired' },
-}
-const SESSION = { session_key: 'sk-1', title: '文献综述', updated_at: '' }
+const SESSION = { id: 'sk-1', title: '文献综述', createdAt: '', updatedAt: '' }
 
 describe('ChatHeader', () => {
   it('长标题保留完整提示，容器与连接状态保持独立标签', () => {
@@ -40,28 +31,31 @@ describe('ChatHeader', () => {
 })
 
 describe('ChatSidebar', () => {
-  it('渲染容器/会话 + 选中态 + 删除/新建 emits', async () => {
+  it('渲染会话扁平列表 + 选中态 + 删除/新建/选中 emits（#793 容器维度退役）', async () => {
     const w = mount(ChatSidebar, {
       props: {
-        instances: [INSTANCE],
         sessions: [SESSION],
-        selectedContainer: 'demo',
-        selectedSession: '',
+        selectedSession: 'sk-1',
       },
     })
-    expect(w.text()).toContain('demo')
     expect(w.text()).toContain('文献综述')
     await w.find('[data-test="new-session"]').trigger('click')
     expect(w.emitted('newSession')).toBeTruthy()
     await w.find('[data-test="delete-session-sk-1"]').trigger('click')
     expect(w.emitted('removeSession')?.[0]).toEqual(['sk-1'])
-    await w.find('[data-test="container-demo"]').trigger('click')
-    expect(w.emitted('selectContainer')?.[0]).toEqual(['demo'])
     await w.find('[data-test="session-sk-1"]').trigger('click')
     expect(w.emitted('selectSession')?.[0]).toEqual(['sk-1'])
-    expect(w.get('[data-test="container-demo"]').element.tagName).toBe('BUTTON')
     expect(w.get('[data-test="session-sk-1"]').element.tagName).toBe('BUTTON')
     expect(w.get('[data-test="delete-session-sk-1"]').element.tagName).toBe('BUTTON')
+  })
+
+  it('空会话列表 → 渲染 empty slot（无容器分组残留）', () => {
+    const w = mount(ChatSidebar, {
+      props: { sessions: [], selectedSession: '' },
+      slots: { empty: '<li data-test="empty-slot">无会话</li>' },
+    })
+    expect(w.find('[data-test="empty-slot"]').exists()).toBe(true)
+    expect(w.find('[data-test="side-tab-sessions"]').exists()).toBe(true)
   })
 })
 
@@ -142,7 +136,7 @@ describe('ChatMessageItem', () => {
 
   it('#515: 含附件的用户消息不显示误导性的重新生成入口', () => {
     const user = newMsg('user', '请分析附件')
-    user.media.push({ type: 'image', mimeType: 'image/png', src: 'AA==' })
+    user.media.push({ attachmentId: 'att-u', mime: 'image/png', size: 1, fileName: 'u.png' })
     const answer = newMsg('assistant', '完成'); answer.streaming = false
     const w = mount(ChatStream, {
       props: { messages: [user, answer], historyHasMore: false, historyLoading: false },
@@ -240,93 +234,38 @@ describe('ChatMessageItem', () => {
     expect(userBubbleRule).toContain('background:')
   })
 
-  // ---- #568: 附件元数据呈现（image 尺寸/体积、audio 时长/体积、video 尺寸/时长、document 下载卡、url 形态）----
-  it('#568: image 附件带 width/height/sizeBytes → 元数据行显示尺寸与体积', () => {
+  // ---- 附件媒体（#780 D9 MediaRef 文件卡；内联预览/下载渲染面归 #795）----
+  it('MediaRef 附件 → 文件卡渲染（fileName + 尺寸/时长/体积元数据）', () => {
     const m = newMsg('assistant', '')
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA', width: 1280, height: 720, sizeBytes: 2048 })
+    m.media.push({ attachmentId: 'att-1', mime: 'image/png', size: 2048, fileName: 'shot.png', width: 1280, height: 720 })
     const w = mount(ChatMessageItem, { props: { msg: m } })
-    const meta = w.get('[data-test="media-meta"]')
-    expect(meta.text()).toContain('1280 × 720')
-    expect(meta.text()).toContain('2 KB')
+    const card = w.get('[data-test="media-file"]')
+    expect(card.text()).toContain('shot.png')
+    expect(card.text()).toContain('1280 × 720')
+    expect(card.text()).toContain('2 KB')
   })
-  it('#568: audio 附件带 durationMs/sizeBytes → 元数据行显示时长与体积', () => {
+  it('MediaRef 时长元数据 → mm:ss 文案', () => {
     const m = newMsg('assistant', '')
-    m.media.push({ type: 'audio', mimeType: 'audio/mpeg', src: 'QUJD', durationMs: 150000, sizeBytes: 1024 })
+    m.media.push({ attachmentId: 'att-2', mime: 'audio/mpeg', size: 1024, fileName: 'a.mp3', durationMs: 150000 })
     const w = mount(ChatMessageItem, { props: { msg: m } })
-    const meta = w.get('[data-test="media-meta"]')
-    expect(meta.text()).toContain('2:30')
-    expect(meta.text()).toContain('1 KB')
+    expect(w.get('[data-test="media-file"]').text()).toContain('2:30')
   })
-  it('#568: video 附件带 width/height/durationMs → 元数据行显示尺寸与时长', () => {
+  it('多条 MediaRef → 多张文件卡纵向堆叠', () => {
     const m = newMsg('assistant', '')
-    m.media.push({ type: 'video', mimeType: 'video/mp4', src: 'REVG', width: 640, height: 360, durationMs: 60000 })
+    m.media.push({ attachmentId: 'a1', mime: 'application/pdf', size: 100, fileName: 'a.pdf' })
+    m.media.push({ attachmentId: 'a2', mime: 'text/plain', size: 100, fileName: 'b.txt' })
     const w = mount(ChatMessageItem, { props: { msg: m } })
-    const meta = w.get('[data-test="media-meta"]')
-    expect(meta.text()).toContain('640 × 360')
-    expect(meta.text()).toContain('1:00')
+    expect(w.findAll('[data-test="media-file"]').length).toBe(2)
   })
-  it('#568: 无元数据的附件 → 不渲染元数据行（现状无差）', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA' })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.find('[data-test="media-meta"]').exists()).toBe(false)
+  it('无 media 的消息 → 不渲染 media-list', () => {
+    const w = mount(ChatMessageItem, { props: { msg: newMsg('assistant', '纯文本') } })
+    expect(w.find('[data-test="media-list"]').exists()).toBe(false)
   })
-  it('#568: document 附件 → 下载链接卡（fileName + sizeBytes + dataURL href）', () => {
-    const m = newMsg('assistant', '请下载：')
-    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'report.pdf', sizeBytes: 2048 })
+  it('user 消息附件（发送回显）同样渲染文件卡', () => {
+    const m = newMsg('user', '请分析附件')
+    m.media.push({ attachmentId: 'att-9', mime: 'image/png', size: 12, fileName: 'x.png' })
     const w = mount(ChatMessageItem, { props: { msg: m } })
-    const link = w.get('[data-test="media-document"]')
-    expect(link.text()).toContain('report.pdf')
-    expect(link.text()).toContain('2 KB')
-    expect(link.attributes('href')).toBe('data:application/pdf;base64,JVBER')
-    expect(link.attributes('download')).toBe('report.pdf')
-  })
-  it('#568: document 附件 label 优先于 fileName 展示', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'report.pdf', label: '研究报告', sizeBytes: 2048 })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.get('[data-test="media-document"]').text()).toContain('研究报告')
-  })
-  it('#568: url 形态附件 src 原样使用不拼 base64（mediaSrc http 分支）', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'https://img.example.com/x.png' })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.get('[data-test="media-image"]').attributes('src')).toBe('https://img.example.com/x.png')
-  })
-  it('Phase 2: blob 形态附件 src 原样返回不拼 base64（agent 容器媒体经 files/raw resolve 的 objectURL）', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'blob:http://localhost:5173/1234-5678' })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.get('[data-test="media-image"]').attributes('src')).toBe('blob:http://localhost:5173/1234-5678')
-  })
-  it('#568: url 形态 document → href 直用 url（不拼 base64），download 仍生效', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'https://files.example.com/report.pdf', fileName: 'report.pdf' })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    const link = w.get('[data-test="media-document"]')
-    expect(link.attributes('href')).toBe('https://files.example.com/report.pdf')
-    expect(link.attributes('download')).toBe('report.pdf')
-  })
-  // ---- #568 安全修复（security review）：document dataURL href mime 白名单 + mediaSrc scheme 防御 ----
-  it('#568(security): document 非白名单 mime（text/html / image/svg+xml）→ 不渲染下载卡（防下载脚本类文件）', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'document', mimeType: 'text/html', src: 'PGh0bWw+', fileName: 'x.html', sizeBytes: 100 })
-    m.media.push({ type: 'document', mimeType: 'image/svg+xml', src: 'PHN2Zz4=', fileName: 'x.svg', sizeBytes: 100 })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.find('[data-test="media-document"]').exists()).toBe(false)
-  })
-  it('#568(security): document 白名单 mime（application/pdf / text/plain）→ 渲染下载卡', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'document', mimeType: 'application/pdf', src: 'JVBER', fileName: 'a.pdf', sizeBytes: 100 })
-    m.media.push({ type: 'document', mimeType: 'text/plain', src: 'aGVsbG8=', fileName: 'b.txt', sizeBytes: 100 })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.findAll('[data-test="media-document"]').length).toBe(2)
-  })
-  it('#568(security): mediaSrc 对 javascript: scheme src 不原样透出（拼进 base64 段，解码失败不渲染）', () => {
-    const m = newMsg('assistant', '')
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'javascript:alert(1)' })
-    const w = mount(ChatMessageItem, { props: { msg: m } })
-    expect(w.get('[data-test="media-image"]').attributes('src')?.startsWith('data:image/png;base64,')).toBe(true)
+    expect(w.get('[data-test="media-file"]').text()).toContain('x.png')
   })
 })
 
@@ -473,14 +412,14 @@ describe('ChatMessageItem 轮次折叠（#664 T1）', () => {
   it('折叠态只渲染条面（思考卡/工具行不渲染）；正文、附件、AI 提示条仍可见', () => {
     const m = tracedAssistant()
     m.traceFolded = true
-    m.media.push({ type: 'image', mimeType: 'image/png', src: 'AAA' })
+    m.media.push({ attachmentId: 'att-f', mime: 'image/png', size: 1, fileName: 'f.png' })
     const w = mount(ChatMessageItem, { props: { msg: m } })
     expect(w.find('[data-test="trace-fold"]').exists()).toBe(true) // 条面在
     expect(w.get('[data-test="trace-fold-label"]').text()).toBe('执行过程 · 思考 · 2 次工具')
     expect(w.find('[data-test="cot-card"]').exists()).toBe(false) // 轨迹收起
     expect(w.find('[data-test="tool-line"]').exists()).toBe(false)
     expect(w.text()).toContain('总结正文') // 正文恒在外
-    expect(w.find('[data-test="media-image"]').exists()).toBe(true) // 附件恒在外
+    expect(w.find('[data-test="media-file"]').exists()).toBe(true) // 附件恒在外
     expect(w.find('[data-test="ai-notice"]').text()).toContain('内容由 AI 生成') // AI 提示条恒在外
   })
 
@@ -593,13 +532,13 @@ describe('ChatMessageItem 轮次折叠（#664 T1）', () => {
   })
 })
 
-// 审批卡测试与 ChatStream 合并时间线测试共用的卡片基底
+// 审批卡测试与 ApprovalDock 共用的卡片基底（#783 升级通道形状：allow/deny 两值）
 const card: ApprovalItem = {
   id: 'a1',
-  kind: 'exec',
-  command: 'rm -rf /tmp/x',
-  sessionKey: null,
-  agentId: null,
+  source: 'cautious-mode',
+  toolName: 'bash',
+  toolCallSummary: 'rm -rf /tmp/x',
+  teammateId: null,
   status: 'pending',
   decision: '',
   detailOpen: false,
@@ -607,22 +546,14 @@ const card: ApprovalItem = {
 }
 describe('ApprovalCard', () => {
 
-  it('批准/拒绝 emit + 断线禁用按钮', async () => {
+  it('批准/拒绝 emit + 断线禁用按钮（decision 两值 allow/deny）', async () => {
     const w = mount(ApprovalCard, { props: { approval: card, disconnected: false } })
     await w.find('[data-test="approve-a1"]').trigger('click')
-    expect(w.emitted('resolve')?.[0]).toEqual([card, 'allow-once'])
+    expect(w.emitted('resolve')?.[0]).toEqual([card, 'allow'])
     await w.find('[data-test="deny-a1"]').trigger('click')
     expect(w.emitted('resolve')?.[1]).toEqual([card, 'deny'])
     const dw = mount(ApprovalCard, { props: { approval: card, disconnected: true } })
     expect(dw.find('[data-test="approve-a1"]').attributes('disabled')).toBeDefined()
-  })
-
-  it('已解决态：按钮消失 + 权威 decision 标签', () => {
-    const w = mount(ApprovalCard, {
-      props: { approval: { ...card, status: 'resolved', decision: 'allow-once' }, disconnected: false },
-    })
-    expect(w.find('[data-test="approve-a1"]').exists()).toBe(false)
-    expect(w.text()).toContain('已批准')
   })
 
   // #492：失效态（网关侧审批过期/已处理）——终态不可回覆：按钮消失 + 「已失效」标签
@@ -636,39 +567,36 @@ describe('ApprovalCard', () => {
     expect(w.text()).toContain('已失效')
   })
 
-  // #405-T3（#408）：来源徽标——subagent 审批卡带 agentId 徽标，main 审批无徽标
-  it('subagent 审批卡（agentId 非空）→ 徽标显示 agentId 值', () => {
+  // #793：teammate 审批来源徽标（具名折叠区泛化归 #796；此处仅徽标位）
+  it('teammate 审批卡（teammateId 非空）→ 「队友协作」徽标', () => {
     const w = mount(ApprovalCard, {
-      props: { approval: { ...card, agentId: 'sub-agent-7' }, disconnected: false },
+      props: { approval: { ...card, teammateId: 'peer-1' }, disconnected: false },
     })
     const badge = w.find('[data-test="approval-source"]')
     expect(badge.exists()).toBe(true)
-    expect(badge.text()).toContain('sub-agent-7')
+    expect(badge.text()).toContain('队友协作')
   })
 
-  it('subagent 审批卡（agentId 缺失、sessionKey 判定）→ 徽标降级「subagent」', () => {
-    const w = mount(ApprovalCard, {
-      props: { approval: { ...card, sessionKey: 'agent:main:subagent:abc-123' }, disconnected: false },
-    })
-    const badge = w.find('[data-test="approval-source"]')
-    expect(badge.exists()).toBe(true)
-    // 精确断言：降级标签是「subagent」而非 sessionKey 原样（toContain 会被子串掩盖）
-    expect(badge.text()).toEqual('subagent')
-  })
-
-  it('subagent 审批卡（agentId 空串 + subagent 形态 sessionKey）→ 徽标降级「subagent」', () => {
-    // 空串 agentId 视同缺失（0 信任）：门控靠 sessionKey 形态通过，文本走 || 降级
-    const w = mount(ApprovalCard, {
-      props: { approval: { ...card, agentId: '', sessionKey: 'agent:main:subagent:abc-123' }, disconnected: false },
-    })
-    const badge = w.find('[data-test="approval-source"]')
-    expect(badge.exists()).toBe(true)
-    expect(badge.text()).toEqual('subagent')
-  })
-
-  it('main 会话审批（agentId 空且非 subagent 形态）→ 无徽标', () => {
+  it('主会话审批（teammateId null）→ 无徽标', () => {
     const w = mount(ApprovalCard, { props: { approval: card, disconnected: false } })
     expect(w.find('[data-test="approval-source"]').exists()).toBe(false)
+  })
+
+  it('详情展开 → 升级来源 + judge 理由 + 参数摘要全文（detailOpen 由父层落 store，卡为哑组件）', async () => {
+    const w = mount(ApprovalCard, {
+      props: { approval: { ...card, judgeReason: '连续三次被拒', detailOpen: true }, disconnected: false },
+    })
+    await w.get('[data-test="detail-a1"]').trigger('click')
+    expect(w.emitted('toggleDetail')).toBeTruthy()
+    const detail = w.get('[data-test="approval-detail-a1"]')
+    expect(detail.text()).toContain('cautious-mode')
+    expect(detail.text()).toContain('连续三次被拒')
+    expect(detail.text()).toContain('rm -rf /tmp/x')
+  })
+
+  it('标题行展示工具名（升级通道摘要）', () => {
+    const w = mount(ApprovalCard, { props: { approval: card, disconnected: false } })
+    expect(w.text()).toContain('agent 请求执行 bash')
   })
 })
 
@@ -682,7 +610,7 @@ describe('ApprovalDock', () => {
     await w.get('[data-test="deny-a1"]').trigger('click')
     await w.get('[data-test="detail-a1"]').trigger('click')
 
-    expect(w.emitted('resolve')?.[0]).toEqual([approval, 'allow-once'])
+    expect(w.emitted('resolve')?.[0]).toEqual([approval, 'allow'])
     expect(w.emitted('resolve')?.[1]).toEqual([approval, 'deny'])
     expect(w.emitted('toggleDetail')?.[0]).toEqual([approval])
   })
@@ -1021,7 +949,7 @@ describe('ChatStream 锚点导航接线（issue #669）', () => {
   it('hover 刻度 → 摘要文本（前几十字截断 / 纯媒体占位）', async () => {
     const long = '长'.repeat(50)
     const media = U('')
-    media.media.push({ type: 'image', mimeType: 'image/png', src: 'AA==' })
+    media.media.push({ attachmentId: 'att-h', mime: 'image/png', size: 1, fileName: 'h.png' })
     const w = mount(ChatStream, {
       props: { messages: [], historyHasMore: false, historyLoading: false },
     })
@@ -1164,7 +1092,7 @@ describe('ChatStream 锚点导航接线（issue #669）', () => {
 describe('#694 回退入口与确认 popover', () => {
   const userWithEntry = (text = '第一问') => {
     const m = newMsg('user', text)
-    m.entryId = 'entry-1'
+    m.id = 'msg-1'
     return m
   }
 
@@ -1180,22 +1108,22 @@ describe('#694 回退入口与确认 popover', () => {
       ...(attachTo ? { attachTo } : {}),
     })
 
-  it('已持久化 user 消息（有 entryId）→ hover 操作条渲染「回退」入口', () => {
+  it('已持久化 user 消息（有消息行 id）→ hover 操作条渲染「回退」入口', () => {
     const w = mountItem(userWithEntry())
     expect(w.find('[data-test="msg-actions"]').exists()).toBe(true)
     expect(w.get('[data-test="rewind"]').text()).toBe('回退')
     expect(w.get('[data-test="rewind"]').attributes('aria-label')).toBe('Rewind') // aria 保持英文
   })
 
-  it('无 entryId（本地乐观 echo / 异常形状）→ 不渲染任何消息级操作入口', () => {
+  it('无 id（本地乐观 echo 未回填 / 异常形状）→ 不渲染任何消息级操作入口', () => {
     const w = mountItem(newMsg('user', '刚发出还没落库'))
     expect(w.find('[data-test="msg-actions"]').exists()).toBe(false)
   })
 
-  it('assistant 消息即使有 entryId 也无回退入口（回退只针对用户消息）', () => {
+  it('assistant 消息即使有 id 也无回退入口（回退只针对用户消息）', () => {
     const m = newMsg('assistant', '回答')
     m.streaming = false
-    m.entryId = 'entry-2'
+    m.id = 'msg-2'
     const w = mountItem(m)
     expect(w.find('[data-test="msg-actions"]').exists()).toBe(false)
   })
@@ -1363,7 +1291,7 @@ describe('#694 回退入口与确认 popover', () => {
     }
   })
 
-  it('ChatStream 转发 rewind（携带所属消息，父层据此取 entryId）', async () => {
+  it('ChatStream 转发 rewind（携带所属消息，父层据此取消息行 id）', async () => {
     const msg = userWithEntry()
     const w = mount(ChatStream, {
       props: { messages: [msg], historyHasMore: false, historyLoading: false, rewindAvailable: true },
@@ -1379,7 +1307,7 @@ describe('#694 回退入口与确认 popover', () => {
 describe('#697 fork 入口', () => {
   const userWithEntry = (text = '第一问') => {
     const m = newMsg('user', text)
-    m.entryId = 'entry-1'
+    m.id = 'msg-1'
     return m
   }
 
@@ -1393,12 +1321,12 @@ describe('#697 fork 入口', () => {
     expect(w.get('[data-test="fork"]').attributes('aria-label')).toBe('Fork')
   })
 
-  it('无 entryId / assistant 消息 → 无 fork 入口（与回退同一身份门）', () => {
+  it('无 id / assistant 消息 → 无 fork 入口（与回退同一身份门）', () => {
     const w1 = mountItem(newMsg('user', '没落库'))
     expect(w1.find('[data-test="fork"]').exists()).toBe(false)
     const m = newMsg('assistant', '回答')
     m.streaming = false
-    m.entryId = 'entry-2'
+    m.id = 'msg-2'
     const w2 = mountItem(m)
     expect(w2.find('[data-test="fork"]').exists()).toBe(false)
   })

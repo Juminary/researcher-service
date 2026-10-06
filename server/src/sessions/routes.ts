@@ -16,6 +16,7 @@ import {
   sessionForkSchema,
   sessionPatchSchema,
   sessionResumeSchema,
+  sessionRewindPreviewSchema,
   sessionRewindSchema,
 } from '../validation/schemas'
 import { MESSAGE_KEY_REGEX } from './values'
@@ -105,11 +106,18 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     ok(res, await deps.service.getProjection(req.user!, pathId(req)))
   })
 
-  // POST /:id/rewind —— 回退重开（story 16）：换 activeCheckpointId 指针 + 被放弃路线软删
-  //（#770）+ session.invalidated{reason:rewind} 广播。文件逆放归 #782。
+  // POST /:id/rewind —— 回退重开（story 16 · #782 三态）：换 activeCheckpointId 指针 + 被放弃
+  // 路线软删（#770）+ 文件逆放（scope=all 缺省；chat = 只回对话；files = 只回文件）+
+  // session.invalidated{reason:rewind} 广播。
   router.post('/:id/rewind', validateBody(sessionRewindSchema), async (req: Request, res: Response) => {
-    const { messageId } = req.body as z.infer<typeof sessionRewindSchema>
-    ok(res, await deps.service.rewindSession(req.user!, pathId(req), { messageId }))
+    const { messageId, scope } = req.body as z.infer<typeof sessionRewindSchema>
+    ok(res, await deps.service.rewindSession(req.user!, pathId(req), { messageId, scope }))
+  })
+
+  // POST /:id/rewind/preview —— 回退预览（#782 · D8）：逆放集摘要 + exec 跨越清单。只读。
+  router.post('/:id/rewind/preview', validateBody(sessionRewindPreviewSchema), async (req: Request, res: Response) => {
+    const { messageId } = req.body as z.infer<typeof sessionRewindPreviewSchema>
+    ok(res, await deps.service.rewindPreview(req.user!, pathId(req), { messageId }))
   })
 
   // POST /:id/fork —— 复制出新会话（story 18/20 · #768 D7）：state/沙箱/journal/attachments

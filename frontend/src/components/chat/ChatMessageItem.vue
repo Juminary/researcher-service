@@ -3,12 +3,11 @@
 // thinking/tool-line slot 注入点：默认渲染 ThinkingCard/ToolLine；父可经 slot 覆盖表现。
 // #401 / ticket #402：assistant 正文走 MarkdownRenderer（v-html + DOMPurify 消毒），
 // user 保持纯文本（用户输入的 * # _ 不当语法）；流式光标由 MarkdownRenderer streaming 控制。
-// #459-T3 #464：附件媒体块（msg.media）渲染——image→img / audio→audio controls / video→video
-// controls；src 为纯 base64，此处重建完整 dataURL（data:<mime>;base64,<src>）。user 与 assistant
-// 均渲染（user 发送的附件 echo / AI 工具产出的多媒体如 browser 截图）。
+// 附件媒体（#780 D9 attachmentsJson v1）：msg.media 为 MediaRef 引用面（attachmentId/mime/size/
+// fileName），#793 以文件卡呈现（文件名 + 体积；下载/内联预览渲染面归 #795——字节经 Bearer 门
+// GET /attachments/:id/download，<img src> 直发不可达）。user 与 assistant 均渲染。
 import type { Msg } from '@/stores/chat'
 import { hasTrace } from '@/stores/chat'
-import type { MediaBlock } from '@/chat/eventTranslate'
 // #555:工具聚合摘要——summarizeToolGroup 纯函数 + ToolRow→{name,args,isError} 三元组适配
 import { summarizeToolGroup } from '@/chat/toolRender/tool-call-grouping'
 import { toolRowToGroupInput } from '@/chat/toolRender/adapt'
@@ -24,13 +23,10 @@ const props = withDefaults(
   defineProps<{
     msg: Msg
     regenerateText?: string
-    // #694：回退入口是否可用（由 ChatView 计算：网关支持会话控制 且 agent 未在工作、连接未断）。
-    // false 时入口整体**不渲染**（官方同构：busy 时 hover 按钮不渲染，而非禁用态）。缺省 false =
-    // fail-closed：能力门未被宿主打开就不渲染，不出现点了必然报错的按钮（与 regenerateText 缺省
-    // 隐藏同款「缺省即不给动作」语义）。
+    // #694/#794：回退入口是否可用（宿主计算）。#793 新管线暂不开启（rewind/fork 编排归 #794），
+    // 缺省 false = fail-closed：能力门未被宿主打开就不渲染，不出现点了必然报错的按钮。
     rewindAvailable?: boolean
-    // #697：fork 入口是否可用（宿主单独开门——与回退共享能力/身份门，但 busy 互斥独立计算）。
-    // 同款 fail-closed。
+    // #697/#794：fork 入口是否可用（同 rewind 语义）。
     forkAvailable?: boolean
   }>(),
   { rewindAvailable: false, forkAvailable: false },
@@ -53,12 +49,12 @@ const traceFoldable = computed(
 // echo 与异常形状消息无 id，回退必然被网关拒）+ rewindAvailable（agent 工作中/连接异常/网关不支持
 // 会话控制）。见模板 hover 操作条。
 const rewindVisible = computed(
-  () => props.msg.role === 'user' && Boolean(props.msg.entryId) && props.rewindAvailable,
+  () => props.msg.role === 'user' && Boolean(props.msg.id) && props.rewindAvailable,
 )
 // #697 fork 入口：身份门与回退一致（已持久化 user 消息），能力门独立（宿主分别开门——
 // rewind/fork 在途互斥时只隐藏其中一侧）。
 const forkVisible = computed(
-  () => props.msg.role === 'user' && Boolean(props.msg.entryId) && props.forkAvailable,
+  () => props.msg.role === 'user' && Boolean(props.msg.id) && props.forkAvailable,
 )
 // 确认 popover 显隐（本地瞬态；关闭路径见 RewindConfirmPopover）+ 触发按钮 ref（传给 popover 作
 // anchor：落在触发按钮上的按下不算外部点击，保住「再点入口收起」的 toggle 语义）。
@@ -95,39 +91,6 @@ defineSlots<{
   'tool-line'?: (props: { tool: Msg['tools'][number] }) => unknown
 }>()
 
-// 媒体块 src（纯 base64 或完整 url）→ 渲染可用 src。
-// 0 信任（security review：#568 url 形态防御纵深——翻译层已只放行 http(s) url 与纯 base64，本函数
-// 兜底不信任外来 scheme）：http(s) 经 URL 解析校验后原样返回；data: 前缀原样返回；其余一律按纯
-// base64 重建 dataURL——非 http(s) 非 data: 的字符串绝不作为可执行 href 原样透出（被拼进 base64
-// 段，解码失败即不渲染）。
-// Phase 2 图片显示修复：blob: 前缀原样返回——此类 src 恒为 useChatConnection 经受保护 files/raw
-// 端点取字节后本页 URL.createObjectURL 自建（指向内存 blob，无外部注入面，非可执行 href），浏览器
-// 按 blob 自带的 image/* mime 渲染；若不识别而拼 base64，blob: 段解码失败即不渲染（图片丢失）。
-function isHttpUrl(s: string): boolean {
-  try {
-    const u = new URL(s)
-    return u.protocol === 'http:' || u.protocol === 'https:'
-  } catch {
-    return false
-  }
-}
-function mediaSrc(m: MediaBlock): string {
-  if (isHttpUrl(m.src)) return m.src
-  if (m.src.startsWith('data:')) return m.src
-  if (m.src.startsWith('blob:')) return m.src
-  return `data:${m.mimeType};base64,${m.src}`
-}
-// #568 安全修复（security review）：document 下载卡 mime 白名单——base64 形态的 dataURL href 只对
-// 白名单 mime 放行（防下载到 text/html / image/svg+xml 等可执行/脚本类文件被用户打开执行）。url
-// 形态为显式点击链接（download 属性），不受限。非白名单 base64 document 回退旧行为（静默不渲染）。
-// 发送侧白名单（chat/attachments.ts DOCUMENT_MIMES）与本清单同步改：两侧一致文档附件才
-// 「发得出 + 渲染得出下载卡」（text/markdown 为浏览器无注册 mime 的典型，发送侧按扩展名派生）。
-const SAFE_DOCUMENT_MIMES = ['application/pdf', 'text/plain', 'text/markdown', 'text/csv', 'application/json', 'application/zip', 'application/gzip', 'application/x-tar']
-function isSafeDocumentMime(mimeType: string): boolean {
-  if (mimeType === 'image/svg+xml') return false // 可嵌脚本，排除
-  if (mimeType.startsWith('image/') || mimeType.startsWith('audio/') || mimeType.startsWith('video/')) return true
-  return SAFE_DOCUMENT_MIMES.includes(mimeType)
-}
 // #568: 附件体积人类可读（字节 → B/KB/MB）；durationMs → mm:ss（播放器惯用格式）。
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -239,80 +202,16 @@ const copyState = ref<'idle' | 'copied' | 'failed'>('idle')
       <!-- #401：assistant 渲染 markdown（含流式光标），user 保持纯文本 + 光标 -->
       <MarkdownRenderer v-if="msg.role === 'assistant'" :text="msg.text" :streaming="msg.streaming" />
       <template v-else>{{ msg.text }}<span v-if="msg.streaming" class="cursor"></span></template>
-      <!-- #459-T3 #464：附件媒体块（image/audio/video）——历史/流式/发送 echo 三源统一渲染。
-           纯图片消息（text 空）也经此渲染出图片，不影响对话展示。
-           #568: 附件元数据呈现——image 尺寸/体积、audio 时长/体积、video 尺寸/时长（有才显示，
-           元数据缺省则与现状无差）；document 第 4 分支渲染成下载链接卡（label/fileName + sizeBytes）。 -->
+      <!-- 附件媒体（#780 D9 MediaRef）：文件卡列表（名称 + 体积）；内联预览/下载渲染面归 #795 -->
       <div v-if="msg.media.length" class="media-list" data-test="media-list">
-        <template v-for="(m, mi) in msg.media" :key="`media-${mi}`">
-          <img
-            v-if="m.type === 'image'"
-            class="media-image"
-            data-test="media-image"
-            :src="mediaSrc(m)"
-            :alt="m.fileName || '图片附件'"
-            loading="lazy"
-            referrerpolicy="no-referrer"
-          />
-          <div
-            v-if="m.type === 'image' && ((m.width && m.height) || m.sizeBytes != null)"
-            class="media-meta"
-            data-test="media-meta"
-          >
-            <span v-if="m.width && m.height">{{ m.width }} × {{ m.height }}</span>
-            <span v-if="m.sizeBytes != null">{{ formatBytes(m.sizeBytes) }}</span>
-          </div>
-          <audio
-            v-if="m.type === 'audio'"
-            class="media-audio"
-            data-test="media-audio"
-            :src="mediaSrc(m)"
-            controls
-            preload="metadata"
-            referrerpolicy="no-referrer"
-          ></audio>
-          <div
-            v-if="m.type === 'audio' && (m.durationMs != null || m.sizeBytes != null)"
-            class="media-meta"
-            data-test="media-meta"
-          >
-            <span v-if="m.durationMs != null">{{ formatDuration(m.durationMs) }}</span>
-            <span v-if="m.sizeBytes != null">{{ formatBytes(m.sizeBytes) }}</span>
-          </div>
-          <video
-            v-if="m.type === 'video'"
-            class="media-video"
-            data-test="media-video"
-            :src="mediaSrc(m)"
-            controls
-            preload="metadata"
-            referrerpolicy="no-referrer"
-          ></video>
-          <div
-            v-if="m.type === 'video' && ((m.width && m.height) || m.durationMs != null)"
-            class="media-meta"
-            data-test="media-meta"
-          >
+        <div v-for="(m, mi) in msg.media" :key="`media-${mi}`" class="media-file" data-test="media-file">
+          <span class="media-file-name" :title="m.fileName">{{ m.fileName || '附件' }}</span>
+          <span class="media-file-meta">
             <span v-if="m.width && m.height">{{ m.width }} × {{ m.height }}</span>
             <span v-if="m.durationMs != null">{{ formatDuration(m.durationMs) }}</span>
-          </div>
-          <!-- #568: document 下载链接卡——base64 形态 href 为 dataURL（mime 白名单外不渲染）、url
-               形态直用完整 url；download 属性触发下载；label 优先于 fileName 展示。外部 url 显式
-               点击才请求，referrerpolicy/rel 防来源泄漏与 opener 劫持。 -->
-          <a
-            v-if="m.type === 'document' && (isHttpUrl(m.src) || isSafeDocumentMime(m.mimeType))"
-            class="media-document"
-            data-test="media-document"
-            :href="mediaSrc(m)"
-            :download="m.fileName"
-            target="_blank"
-            rel="noopener noreferrer"
-            referrerpolicy="no-referrer"
-          >
-            <span class="media-document-name">{{ m.label || m.fileName || '附件' }}</span>
-            <span v-if="m.sizeBytes != null" class="media-document-size">{{ formatBytes(m.sizeBytes) }}</span>
-          </a>
-        </template>
+            <span v-if="m.size != null">{{ formatBytes(m.size) }}</span>
+          </span>
+        </div>
       </div>
       <div v-if="msg.role === 'assistant' && !msg.streaming" class="ai-notice" data-test="ai-notice">
         <span>内容由 AI 生成，仅供参考</span>
@@ -372,20 +271,12 @@ const copyState = ref<'idle' | 'copied' | 'failed'>('idle')
 .cursor { display: inline-block; width: 7px; height: 14px; background: var(--el-color-primary); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
-/* #459-T3 #464：附件媒体块——约束在气泡宽度内，多附件纵向堆叠留白 */
+/* 附件媒体文件卡（#780 D9 MediaRef 渲染）：约束在气泡宽度内，多附件纵向堆叠留白 */
 .media-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .media-list:first-child { margin-top: 0; }
-.media-image { max-width: 100%; max-height: 320px; border-radius: 8px; object-fit: contain; display: block; }
-.media-audio { max-width: 100%; width: 320px; display: block; }
-.media-video { max-width: 100%; max-height: 320px; border-radius: 8px; display: block; }
-
-/* #568: 附件元数据行（尺寸/时长/体积）——小字次要色，位于媒体元素下方 */
-.media-meta { display: flex; gap: 10px; margin-top: 4px; font-size: 12px; color: var(--el-text-color-secondary); }
-
-/* #568: document 下载链接卡——文件名可截断、体积右对齐 */
-.media-document { display: flex; align-items: center; justify-content: space-between; gap: 10px; max-width: 100%; min-width: 0; padding: 8px 12px; border: 1px solid var(--el-border-color); border-radius: 8px; background: var(--el-fill-color); color: var(--el-color-primary); text-decoration: none; font-size: 13px; }
-.media-document-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.media-document-size { flex-shrink: 0; font-size: 12px; color: var(--el-text-color-secondary); }
+.media-file { display: flex; align-items: center; justify-content: space-between; gap: 10px; max-width: 100%; min-width: 0; padding: 8px 12px; border: 1px solid var(--el-border-color); border-radius: 8px; background: var(--el-fill-color); font-size: 13px; }
+.media-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; color: var(--el-text-color-regular); }
+.media-file-meta { display: flex; gap: 10px; flex-shrink: 0; font-size: 12px; color: var(--el-text-color-secondary); }
 
 /* #555：工具聚合摘要折叠卡（>=2 个工具调用时）——摘要行 + 展开逐行 ToolLine */
 .tool-group { min-width: 0; background: var(--el-fill-color); border: 1px solid var(--el-border-color); border-radius: 9px; padding: 6px 12px; margin: 4px 0; font-size: 12.5px; }

@@ -133,11 +133,14 @@ export class AttachmentsService {
   // 不进入 agent loop）；校验通过 → mkdir + putArchive 单文件 tar 落 `/lab/uploads/<attachmentId>/`
   //（ID 子目录结构性防同名碰撞，D1）。putArchive 覆盖写 = 幂等（resume/重投安全）。返回元数据
   // 供 runner 做图片内联（image mime → 读字节 data URL 多模态 block；文件类由常规 fs 工具自读）。
+  // journalWrite（#782）：注入时物化改由回调承担（journal-first 管线内部 apply——打点先于
+  // 字节落盘）；缺省直写（journal 未接线的测试/降级面）。
   async ingestAttachments(p: {
     sessionId: string
     attachmentIds: readonly string[]
     container: string
     primitives: Pick<SandboxFilePrimitives, 'exec' | 'putArchive'>
+    journalWrite?: (row: { id: string; fileName: string; mimeType: string }, bytes: Buffer) => Promise<void>
   }): Promise<Array<{ attachmentId: string; mimeType: string }>> {
     const rows = await this.deps.prisma.attachment.findMany({
       where: { id: { in: [...p.attachmentIds] }, sessionId: p.sessionId },
@@ -158,8 +161,12 @@ export class AttachmentsService {
       const sha = createHash('sha256').update(buf).digest('hex')
       if (sha !== row.sha256) throw fail(CODE.INTERNAL, `附件内容校验失败（sha256 不符）：${row.id}`)
       const dir = `${ATTACHMENT_LAB_UPLOADS}/${row.id}`
-      await p.primitives.exec(p.container, ['mkdir', '-p', dir])
-      await p.primitives.putArchive(p.container, dir, createTarFile(row.fileName, buf))
+      if (p.journalWrite) {
+        await p.journalWrite({ id: row.id, fileName: row.fileName, mimeType: row.mimeType }, buf)
+      } else {
+        await p.primitives.exec(p.container, ['mkdir', '-p', dir])
+        await p.primitives.putArchive(p.container, dir, createTarFile(row.fileName, buf))
+      }
       metas.push({ attachmentId: row.id, mimeType: row.mimeType })
     }
     return metas
@@ -177,6 +184,8 @@ export class AttachmentsService {
   // 不加列不分目录）→ 建 Attachment 行（messageId 空——assistant 行由 recordTurn 随后落，回放
   // 引用走 attachmentsJson media 数组）。返回 null = 校验失败（调用方降级文本占位 + 审计计数，
   // 不 fail run）。字节读/拷失败（daemon 故障）同样返 null（fail-soft，run 不受累）。
+  // journalWrite（#782）：注入时拷贝改由回调承担（journal-first；attachmentId/fileName 在
+  // 建行前回调——物化失败的行不落账，行建行在回调成功后）。
   async materializeAgentMedia(p: {
     sessionId: string
     ownerId: string
@@ -184,6 +193,7 @@ export class AttachmentsService {
     mime: string
     container: string
     primitives: Pick<SandboxFilePrimitives, 'exec' | 'getArchive' | 'putArchive'>
+    journalWrite?: (row: { attachmentId: string; fileName: string }, bytes: Buffer) => Promise<void>
   }): Promise<AttachmentMeta | null> {
     try {
       // 双保险：路径仍须 /lab/ 前缀且无穿越段（扫描层已保，防御面）
@@ -198,8 +208,12 @@ export class AttachmentsService {
       const sha256 = createHash('sha256').update(buf).digest('hex')
       const attachmentId = snowflakeId()
       const dir = `${ATTACHMENT_LAB_UPLOADS}/${attachmentId}`
-      await p.primitives.exec(p.container, ['mkdir', '-p', dir])
-      await p.primitives.putArchive(p.container, dir, createTarFile(fileName, buf))
+      if (p.journalWrite) {
+        await p.journalWrite({ attachmentId, fileName }, buf)
+      } else {
+        await p.primitives.exec(p.container, ['mkdir', '-p', dir])
+        await p.primitives.putArchive(p.container, dir, createTarFile(fileName, buf))
+      }
       const row = await this.deps.prisma.attachment.create({
         data: {
           id: attachmentId,

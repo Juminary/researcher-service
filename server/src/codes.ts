@@ -72,6 +72,7 @@ export const CODE = {
   RUN_IN_PROGRESS: 50005, // run 进行中（running/queued）禁新输入 + 非终态拒删会话（在飞互斥）——#747 C 节「running 全端禁输入」REST 门禁面
   RUN_NOT_ABORTABLE: 50006, // 无在飞 run 可中断（abort 目标缺失；#777 aborts 条目仅在飞期存在）
   MESSAGE_KEY_CONFLICT: 50007, // 同幂等 key 已用于不同 content（对齐 figures 70041「同 key 不同输入」稳定冲突锁式）
+  FILE_REPLAY_IN_PROGRESS: 50008, // 文件状态重放中（#782 会话写围栏超时——rewind 逆放持有围栏，等待有界报持有者）
   // 9xxxx 系统 / 校验
   OAUTH_NOT_CONFIGURED: 90001, // OAuth provider 未配置（原 501）
   VALIDATION_FAILED: 90002, // 参数校验失败（字段明细进 data）；Idempotency-Key 缺/超长特例 data=null（figures 前置中间件）

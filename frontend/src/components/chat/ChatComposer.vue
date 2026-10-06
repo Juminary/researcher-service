@@ -5,7 +5,7 @@
 // 本组件只收 matches/slashOpen props 渲染菜单，不重复计算。
 // #459-T2 #463：附件采集壳——粘贴/拖拽/文件选择三通道仅做「采 File 上抛」，压缩/校验/发送逻辑全在
 // 宿主 ChatView；预览条只渲染宿主给的 pendingAttachments（含 previewUrl），移除上抛 key。
-import type { SlashOption } from '@/chat/useChatConnection'
+import type { SlashOption } from '@/chat/useChatSession'
 import type { PendingAttachment } from '@/chat/attachments'
 import { nextTick, ref, watch } from 'vue'
 

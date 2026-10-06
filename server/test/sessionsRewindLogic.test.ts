@@ -7,9 +7,11 @@ import { describe, it, expect } from 'vitest'
 import {
   resolveRewindAnchor,
   abandonedCheckpointIds,
+} from '../src/sessions/rewind'
+import {
   visibleRowIds,
   type HistoryRowLite,
-} from '../src/sessions/rewind'
+} from '../src/checkpointChain'
 
 // 行工厂：(turn, role, anchor) —— createdAt 不参与判定（排序由调用方保证），给固定值。
 function row(turn: number, role: string, anchor: string | null): HistoryRowLite {

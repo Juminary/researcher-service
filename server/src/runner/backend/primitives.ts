@@ -18,6 +18,9 @@ export interface ExecOutcome {
 export interface ExecOptions {
   /** 超时毫秒数；缺省或 <=0 = 无超时（内部 mkdir/rm 等固定 argv 调用不传） */
   timeoutMs?: number
+  /** 执行用户（dockerode exec User 选项，如 '0' = root）。缺省 = 容器配置用户（沙箱 1000）。
+   *  消费面仅 filejournal attic（#782：0700 root 目录的建置与 GC rm——daemon 侧 root 写）。 */
+  user?: string
 }
 
 export interface SandboxFilePrimitives {

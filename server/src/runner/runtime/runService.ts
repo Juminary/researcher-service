@@ -76,6 +76,9 @@ import { turnFromCheckpointMessages } from './checkpointTurn'
 import { TurnReducer, isEmptyTurnSnapshot, type RecordTurnPayload, type TurnSnapshot } from '../../sessions/reducer'
 import { TeammateService, type TeammateSummary } from '../teammates/service'
 import { createTeammateTools } from '../teammates/tools'
+import type { FileJournalService } from '../filejournal/service'
+import { createToolCallContextMiddleware, runWithRunContext } from '../filejournal/context'
+import { IDEMPOTENCY_INGEST_PREFIX, IDEMPOTENCY_MEDIA_PREFIX } from '../filejournal/values'
 import { createWikiRetrievalTools } from '../wikisearch'
 import {
   pullWikiGenerationMirror,
@@ -200,6 +203,10 @@ export interface RunServiceDeps {
   readonly downloadNode?: { readonly middleware: AnyAgentMiddleware }
   /** 审批升级超时（默认 48h，729 附录 B；测试注入缩短） */
   readonly approvalTimeoutMs?: number
+  /** 文件 rewind 机制（#782 · D8）：JournalingBackend 打点接缝 + ingestion/D9 物化打点 +
+   *  journal checkpointId 终态回填。缺省不注 = backend 直用 DockerArchiveBackend、物化直写
+   *  （journaling 关闭——测试/降级面）。 */
+  readonly fileJournal?: FileJournalService
   /** #785 per-path 写锁注册表（缺省进程内新建——测试无注入也全量生效；生产由装配层注入
    *  config.runner.writeLockTimeoutMs 形态）。有界等待默认见 DEFAULT_WRITE_LOCK_TIMEOUT_MS。 */
   readonly writeLocks?: WriteLockRegistry
@@ -697,7 +704,7 @@ export class RunService {
           lifecycleTools,
           capabilities,
         })
-      : this.getOrBuildGraph(cmd.sessionId, snapshot.version, policy, model, cmd.ownerId, sandboxSessionId, labContainer, modelKey, tools, capabilities, pluginSurface?.tools ?? [], pluginSurface?.prompt ?? '')
+      : this.getOrBuildGraph(cmd.sessionId, snapshot.version, policy, model, cmd.ownerId, sandboxSessionId, labContainer, modelKey, tools, capabilities, sandboxSessionId, pluginSurface?.tools ?? [], pluginSurface?.prompt ?? '')
 
     // Mailbox recover has already consumed its interrupt; only a fresh resume must match the wait.
     if (cmd.kind === 'resume' && cmd.mailWaitId) {
@@ -829,13 +836,30 @@ export class RunService {
         // resume/重投安全）。校验失败 → throw → 下方 catch → run.failed（ingestion 错误，不进入
         // agent loop）。图片读字节 → 多模态 block 内联进输入（前端已降采样长边 ≤1568px，data URL
         // 满足 provider 内联限制）；文件类只物化、由常规 fs 工具自读（漏斗白名单 lab/** 覆盖）。
+        // #782：journaling 开启时物化改经 journalMaterialize（journal-first——打点先于落盘；
+        // 确定性幂等键 ingest-<attachmentId>）。沙箱惰性创建由该步触发（story 58 语义不变）。
         let imageBlocks: ContentBlock[] = []
         if (cmd.kind === 'message' && cmd.attachmentIds && cmd.attachmentIds.length > 0 && this.deps.attachments) {
+          const fj = this.deps.fileJournal
           const metas = await this.deps.attachments.ingestAttachments({
             sessionId: cmd.sessionId,
             attachmentIds: cmd.attachmentIds,
             container: labContainer,
             primitives: runPrimitives,
+            ...(fj
+              ? {
+                  journalWrite: async (row: { id: string; fileName: string; mimeType: string }, bytes: Buffer) => {
+                    await fj.journalMaterialize({
+                      sessionId: sandboxSessionId,
+                      container: labContainer,
+                      path: `uploads/${row.id}/${row.fileName}`,
+                      bytes,
+                      toolCallId: `${IDEMPOTENCY_INGEST_PREFIX}${row.id}`,
+                      runId: cmd.runId,
+                    })
+                  },
+                }
+              : {}),
           })
           for (const m of metas) {
             if (m.mimeType.startsWith('image/')) {
@@ -867,24 +891,40 @@ export class RunService {
                 })
               : null
 
-        const stream = await agent.streamEvents(input, {
-          ...invocation,
-          recursionLimit: this.recursionLimit,
-          signal: controller.signal,
-          callbacks: [usageHandler],
-          metadata: { ownerId: capabilities.ownerId, ownerPluginIds: [...capabilities.enabledPluginIds], officialContentVersion: capabilities.official.version },
-        })
-        for await (const raw of stream) {
-          // 工具/推理活动刷新沙箱闲置计时（#776 真 activity 源——长 run 中途不被 sweep stop）
-          this.deps.sandboxes?.touch(sandboxSessionId)
-          for (const ev of projector.feed(raw, this.clock())) {
-            turn.feed(ev)
-            this.publish(cmd.ownerId, ev, cmd)
+        // #782 run 上下文（ALS 外层）：journal 行 runId 盖印源（checkpointId 终态回填键）——
+        // 覆盖流创建与消费全程（backend 打点在流内发生）
+        await runWithRunContext(cmd.runId, async () => {
+          const stream = await agent.streamEvents(input, {
+            ...invocation,
+            recursionLimit: this.recursionLimit,
+            signal: controller.signal,
+            callbacks: [usageHandler],
+            metadata: { ownerId: capabilities.ownerId, ownerPluginIds: [...capabilities.enabledPluginIds], officialContentVersion: capabilities.official.version },
+          })
+          for await (const raw of stream) {
+            // 工具/推理活动刷新沙箱闲置计时（#776 真 activity 源——长 run 中途不被 sweep stop）
+            this.deps.sandboxes?.touch(sandboxSessionId)
+            for (const ev of projector.feed(raw, this.clock())) {
+              turn.feed(ev)
+              this.publish(cmd.ownerId, ev, cmd)
+            }
           }
-        }
+        })
         // 流正常结束：判定停在 interrupt（PoC 形态：next 非空或 tasks 带 interrupts）
         const state = await this.graphState(agent, cmd.sessionId)
         anchorCheckpointId = state.config?.configurable?.checkpoint_id ?? null
+        // #782 journal checkpointId 终态回填（completed/interrupted 有锚；aborted/failed 保持
+        // pending ''——被放弃 turn 的 op 恒逆放，保守方向）。fail-soft：回填失败不放大终态。
+        if (anchorCheckpointId !== null) {
+          try {
+            await this.deps.prisma.fileJournal.updateMany({
+              where: { sessionId: sandboxSessionId, runId: cmd.runId },
+              data: { checkpointId: anchorCheckpointId },
+            })
+          } catch (err) {
+            console.warn(`[runner] journal checkpointId 回填失败: run=${cmd.runId}: ${String(err)}`)
+          }
+        }
         const interrupted =
           (state.next?.length ?? 0) > 0 || (state.tasks?.some((t) => (t.interrupts?.length ?? 0) > 0) ?? false)
         if (interrupted) {
@@ -935,6 +975,7 @@ export class RunService {
               console.warn(`[runner] media block degraded: session=${cmd.sessionId} path=${declaredPath} reason=${reason}`)
             }
             for (const block of scan.materializable) {
+              const fj = this.deps.fileJournal
               const meta = await this.deps.attachments.materializeAgentMedia({
                 sessionId: sandboxSessionId,
                 ownerId: session.ownerId,
@@ -942,6 +983,23 @@ export class RunService {
                 mime: block.mime,
                 container: labContainer,
                 primitives: runPrimitives,
+                ...(fj
+                  ? {
+                      journalWrite: async (row: { attachmentId: string; fileName: string }, bytes: Buffer) => {
+                        await fj.journalMaterialize({
+                          sessionId: sandboxSessionId,
+                          container: labContainer,
+                          path: `uploads/${row.attachmentId}/${row.fileName}`,
+                          bytes,
+                          toolCallId: `${IDEMPOTENCY_MEDIA_PREFIX}${row.attachmentId}`,
+                          runId: cmd.runId,
+                          // 直盖终态锚：本 run 的 checkpointId 回填 updateMany（stream 结束处）
+                          // 已执行完、先于本次物化 insert——不直盖则 media 行恒 pending 恒逆放
+                          ...(anchorCheckpointId !== null ? { checkpointId: anchorCheckpointId } : {}),
+                        })
+                      },
+                    }
+                  : {}),
               })
               if (meta) {
                 const ref = {
@@ -1402,8 +1460,15 @@ export class RunService {
   // 运行期中间件装配（非拓扑因子——不入缓存键）：#786 teammate 委派 + #783 审批漏斗 +
   // #780 下载校验节点（file 写类工具成功后物化产物 + 下载引用进 tool 输出；跨 run 状态由
   // 各中间件 per-thread 槽管理）。leader 缓存路径与 #790 wiki-update 跳缓存路径共享。
+  // 中间件（运行期行为非拓扑因子——不入缓存键）：#782 工具调用上下文盖印（journal 幂等键
+  // ALS 源，链首位——journaling 开启恒注入）+ teammate delegation + #783 审批漏斗 + #780 下载
+  // 校验节点（file 写类工具成功后物化产物 + 下载引用进 tool 输出；跨 run 状态由各中间件
+  // per-thread 槽管理，同参数必同拓扑的纯函数约束不受影响）。四依赖全缺 = 空数组（调用点
+  // 不挂 middleware）——leader 图与 wiki-update 图共用本单一来源。
   private runtimeMiddleware(): AnyAgentMiddleware[] {
+    if (!this.deps.teammates && !this.deps.approvals && !this.deps.downloadNode && !this.deps.fileJournal) return []
     return [
+      createToolCallContextMiddleware(),
       ...(this.deps.teammates ? [teammateDelegation] : []),
       ...(this.deps.approvals ? [this.deps.approvals.middleware] : []),
       ...(this.deps.downloadNode ? [this.deps.downloadNode.middleware] : []),
@@ -1422,11 +1487,13 @@ export class RunService {
     modelKey: string,
     tools: NonNullable<LeaderAgentParams['tools']>,
     capabilities: RunCapabilities,
+    journalSessionId: string,
     pluginToolDefs: readonly AnyPluginToolDefinition[],
     pluginPrompt: string,
   ): DeepAgentLike {
     // 双根入键：docker 实例变更（沙箱 remove/recreate、#784 wiki 容器接管后改名）时缓存图
-    // 持旧 backend 会指向已删容器——backend 双根都是拓扑因子。
+    // 持旧 backend 会指向已删容器——backend 双根都是拓扑因子。（journaling backend 无新键
+    // 成分：journal sessionId 与 labContainer 一一对应——researcher-sandbox-<journalSessionId>。）
     const official = capabilities.official
     const wikiContainer = this.deps.resolveWikiContainer(ownerId)
     // 插件目录版本入键（#788）：启用集（capabilities.key）管「哪些插件开」，目录版本管
@@ -1434,11 +1501,20 @@ export class RunService {
     const key = `${threadId}|${configVersion}|${interruptPolicyKey(policy)}|${labContainer}|${wikiContainer}|${capabilities.key}|${modelKey}|${this.deps.plugins?.catalogVersion ?? 'none'}`
     const cached = this.graphs.get(key)
     if (cached) return cached
+    // #782 × #785 接缝：journaling 开启时 backendFor 产出打点装饰器（其 apply 经 putBuffer
+    // 直达原语层）——会话写围栏（fence）已提供 journaling 路径的串行保证，#785 per-path 锁
+    // 面覆盖 journaling off（直用 DockerArchiveBackend）路径。
+    const baseBackend = this.deps.fileJournal
+      ? this.deps.fileJournal.backendFor({
+          sessionId: journalSessionId,
+          targets: { wiki: wikiContainer, lab: labContainer },
+        })
+      : new DockerArchiveBackend(this.deps.primitives, {
+          wiki: wikiContainer,
+          lab: labContainer,
+        })
     const backend = withWriteLocks(
-      new DockerArchiveBackend(this.deps.primitives, {
-        wiki: wikiContainer,
-        lab: labContainer,
-      }),
+      baseBackend,
       { wiki: wikiContainer, lab: labContainer },
       this.writeLocks,
       () => this.writeLockContext(sandboxSessionId, threadId),
@@ -1464,6 +1540,7 @@ export class RunService {
         ? { pluginTools: toLangChainTools(pluginToolDefs, this.deps.plugins.toolContext) }
         : {}),
       ...(pluginPrompt !== '' ? { pluginPrompt } : {}),
+      // 中间件（运行期行为非拓扑因子——不入缓存键，见 runtimeMiddleware()）。
       ...(middleware.length > 0 ? { middleware } : {}),
     })
     // 图实例数护栏（正确性由键保证，此处防长期运行退化；超限整表清——重建成本 =
@@ -1491,10 +1568,18 @@ export class RunService {
     readonly capabilities: RunCapabilities
   }): DeepAgentLike {
     const backend = buildWikiUpdateBackend({
-      defaultBackend: new DockerArchiveBackend(this.deps.primitives, {
-        wiki: p.wikiContainer,
-        lab: p.labContainer,
-      }),
+      // /lab 腿（default leg）带 #782 journaling：teammate 的 lab 写与 leader 图同入
+      // file_journal（journalSessionId = 沙箱所属 session，1:1 对应容器）；/wiki/ 腿走
+      // 镜像副本不 journal（临时目录随 run dispose，落容器只有 finish 单次推回）。
+      defaultBackend: this.deps.fileJournal
+        ? this.deps.fileJournal.backendFor({
+            sessionId: p.sandboxSessionId,
+            targets: { wiki: p.wikiContainer, lab: p.labContainer },
+          })
+        : new DockerArchiveBackend(this.deps.primitives, {
+            wiki: p.wikiContainer,
+            lab: p.labContainer,
+          }),
       wikiRouteBackend: new FilesystemBackend({ rootDir: wikiMirrorRouteRootDir(p.mirror.root), virtualMode: true }),
       targets: { wiki: p.wikiContainer, lab: p.labContainer },
       locks: this.writeLocks,
@@ -1632,6 +1717,31 @@ export class RunService {
     if (!parent) return
     for (const id of ids) {
       this.stopTeammate({ sessionId, ownerId: parent.ownerId }, await teammates.get(sessionId, id))
+    }
+  }
+
+  // C1（#782 · #766）拆两面（时序错配修复）：作废面 rewindFiles **前**调（teammatesForRewind
+  // 复用——防被唤醒 survivor 与逆放竞争围栏 FIFO：survivor 先获围栏的新写 checkpointId='' 会被
+  // 本次逆放撤销）；通知面 rewindFiles **后**调（文案「已逆放恢复」在事实之后——先发信即虚假
+  // 陈述）。degradedFiles（容器缺失/深度超限降级——/lab 未动）→ 文案如实「回退未完成」，不
+  // 虚报「已逆放恢复」。对话面 rewind（scope=chat，文件未动）只走作废面。
+  async teammatesNotifyFileRewind(sessionId: string, checkpointId: string, degradedFiles: boolean): Promise<void> {
+    const teammates = this.deps.teammates
+    if (!teammates) return
+    const survivors = (await teammates.list(sessionId)).filter((t) => t.status !== 'archived')
+    // degraded 文案中性化（scope=files 对话面零改动——「会话已回退至锚点」断言在此组合下
+    // 虚假；半逆放中间态同理）：只述文件面未完成事实，不做对话面/终态承诺
+    const content = degradedFiles
+      ? `文件状态回退未完成——/lab 处于中间态（可重试回退收敛）`
+      : `文件状态已回退至锚点 ${checkpointId.slice(0, 12)}（/lab 已逆放恢复，重放期间写入已排队）`
+    for (const peer of survivors) {
+      await teammates.sendMail({
+        parentSessionId: sessionId,
+        senderTeammateId: null,
+        recipientTeammateId: peer.id,
+        kind: 'system',
+        content,
+      })
     }
   }
 

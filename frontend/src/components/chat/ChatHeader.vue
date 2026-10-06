@@ -6,18 +6,34 @@
 // branchBusy 时触发器禁用（不隐藏——顶栏按钮闪现会推挤布局）且已开菜单强制收起。下拉为手写浮层
 //（RewindConfirmPopover 先例：测试 mount 不装 ElementPlus 插件，仓库无 el-dropdown 使用习惯）。
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { SessionBranchDTO } from '@/chat/gatewayChat'
 
-const props = defineProps<{
-  title: string
-  container: string
-  connecting: boolean
-  branches?: SessionBranchDTO[]
-  branchBusy?: boolean
-}>()
+// 分支菜单数据形状（#794 会话交互票接线投影 branches；#793 新管线暂不灌入——length>1 门恒不渲染）。
+// 随 gatewayChat 类型家删除就地落位（本组件骨架保留，#794 复用时换投影 branches 数据源）。
+interface SessionBranchDTO {
+  leafEntryId: string
+  active: boolean
+  headline?: string
+  messageCount?: number
+  updatedAt?: string
+}
+
+const props = withDefaults(
+  defineProps<{
+    title: string
+    // legacy 容器 tag（#793 chat 容器维度退役后恒空不渲染；prop 保留给分支菜单同窗的 #794 复用）
+    container?: string
+    connecting: boolean
+    branches?: SessionBranchDTO[]
+    branchBusy?: boolean
+    // story 5 标题可改：有选中会话时渲染改名牌（宿主弹确认框，本组件只上抛）
+    renameable?: boolean
+  }>(),
+  { container: '', renameable: false },
+)
 
 const emit = defineEmits<{
   branchSwitch: [leafEntryId: string]
+  rename: []
 }>()
 
 const open = ref(false)
@@ -59,6 +75,15 @@ watch(
 <template>
   <div class="topbar">
     <span class="title" data-test="chat-title" :title="title || '对话'">{{ title || '对话' }}</span>
+    <button
+      v-if="renameable"
+      type="button"
+      class="rename-btn"
+      data-test="rename-session"
+      title="重命名会话"
+      aria-label="重命名会话"
+      @click="emit('rename')"
+    >✎</button>
     <span v-if="container" class="tag">{{ container }}</span>
     <span v-if="connecting" class="tag warn">连接中…</span>
     <div v-if="(branches?.length ?? 0) > 1" ref="root" class="branch-wrap">
@@ -97,6 +122,8 @@ watch(
 <style scoped>
 .topbar { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 18px; border-bottom: 1px solid var(--el-border-color); }
 .title { flex: 1; min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.rename-btn { flex: 0 0 auto; border: none; background: transparent; color: var(--el-text-color-placeholder); cursor: pointer; font-size: 13px; padding: 2px 6px; border-radius: 6px; }
+.rename-btn:hover { color: var(--el-color-primary); background: var(--el-fill-color); }
 .tag { flex: 0 0 auto; white-space: nowrap; font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--el-fill-color-light); color: var(--el-text-color-secondary); }
 .tag.warn { color: var(--el-color-warning); }
 .branch-wrap { position: relative; flex: 0 0 auto; }

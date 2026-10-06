@@ -1,7 +1,7 @@
 // rewind / fork 共用的历史判定纯逻辑（#781 · #747 story 16/18 · #770 软删存档）。
 // 三个判定：锚点解析（消息行 → rewind 锚点 checkpoint）、被放弃 checkpoint 集（未归档全体 −
-// 锚点链）、可见行挂靠（锚点链上每条消息行的归属——rewind 归档与 fork 截断复制共用同一判据）。
-// 不触库、不发布事件（S3 接缝纪律对齐 TurnReducer）。
+// 锚点链）、可见行挂靠（判据本体下沉共享内核 checkpointChain.visibleRowIds——preview 确认门
+// 同源消费）。不触库、不发布事件（S3 接缝纪律对齐 TurnReducer）。
 //
 // 挂靠规则（rewind 后投影 ≡ 锚点时刻 = 「锚点之后写入的轮统统不可见」）：
 //   - assistant 行：anchorCheckpointId 非空 = 权威归属（∈ 锚点链才可见）；为 null（aborted/
@@ -15,17 +15,7 @@
 // → null（调用方 90002）。输入 rows 恒为未归档行（调用方过滤 archivedAt——#770 无恢复入口：
 // 归档行不可再作锚点/切点）。
 
-export interface HistoryRowLite {
-  readonly id: string
-  readonly turn: number
-  readonly role: string
-  readonly anchorCheckpointId: string | null
-  readonly createdAt: Date
-}
-
-function byTurnCreatedAt(a: HistoryRowLite, b: HistoryRowLite): number {
-  return a.turn - b.turn || a.createdAt.getTime() - b.createdAt.getTime()
-}
+import { byTurnCreatedAt, type HistoryRowLite } from '../checkpointChain'
 
 // 解析 rewind 锚点 checkpoint id；不可作锚点（id 不存在 / 会话头部之前无带锚 assistant 可挂靠）
 // → null。assistant 行 → 自身锚点；user/system 行与无锚失败轮 assistant → 前驱最近带锚 assistant
@@ -57,27 +47,5 @@ export function abandonedCheckpointIds(
 }
 
 // 锚点链（含锚点）上的可见消息行 id 集。rows 无需预排序（内部稳定排序），恒输入未归档行。
-// 单遍右→左：带锚 assistant 按链归属解出后作为后继基准；null 锚 assistant 与 user/system
-// 行都挂靠「后继最近 assistant 的已解可见性」（null 锚链式前推）；无后继时 null 锚 assistant
-// 不可见（锚点之后的失败尾部）、user/system 可见（活跃头部新输入）。
-export function visibleRowIds(rows: readonly HistoryRowLite[], anchorChain: ReadonlySet<string>): Set<string> {
-  const sorted = [...rows].sort(byTurnCreatedAt)
-  const n = sorted.length
-  const visible = new Array<boolean>(n)
-
-  let nextAssistantVisible: boolean | undefined // undefined = 后方尚无 assistant 行
-  for (let i = n - 1; i >= 0; i--) {
-    const r = sorted[i]!
-    if (r.role === 'assistant') {
-      visible[i] =
-        r.anchorCheckpointId !== null ? anchorChain.has(r.anchorCheckpointId) : (nextAssistantVisible ?? false)
-      nextAssistantVisible = visible[i]
-    } else {
-      visible[i] = nextAssistantVisible ?? true
-    }
-  }
-
-  const out = new Set<string>()
-  for (let i = 0; i < n; i++) if (visible[i]) out.add(sorted[i]!.id)
-  return out
-}
+// 可见行挂靠判据本体（visibleRowIds）已下沉共享内核 checkpointChain.ts——本文件消费方
+//（sessions/service.ts 归档面）直接从共享内核 import；preview 确认门同源。

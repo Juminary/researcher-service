@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { abortSession, createSession, getSessionProjection, listSessions, resolveSessionApproval, sendSessionMessage, type SessionProjection, type SessionSummary } from '@/api/sessions'
 import SessionTimeline from '@/components/chat/SessionTimeline.vue'
 import { applySessionEvent, reconcileSessionProjection, type SessionEvent } from '@/chat/teamProjection'
-import { openSessionEvents } from '@/chat/useSessionEvents'
+import { useEventStream } from '@/chat/useEventStream'
 import { createRestOutbox } from '@/chat/restOutbox'
 
 const route = useRoute()
@@ -91,7 +91,11 @@ async function approve(id: string, decision: 'allow' | 'deny') {
   await act(async () => { await resolveSessionApproval(selected.value, id, decision); await refresh() })
 }
 watch(selected, () => { projection.value = null; input.value = ''; error.value = ''; void refresh() })
-onMounted(() => { stopEvents = openSessionEvents(onEvent, () => { connected.value = false }, () => { void refresh() }); void refresh() })
+onMounted(() => {
+  const stream = useEventStream({ onEvent, onDisconnect: () => { connected.value = false }, onGap: () => { void refresh() } })
+  stopEvents = stream.close
+  void refresh()
+})
 onBeforeUnmount(() => { disposed = true; stopEvents() })
 </script>
 <template>

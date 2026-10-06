@@ -1,15 +1,17 @@
-// fileTabs store —— workspace 树数据 + 只读文件 tab 状态机（#626 T1 / #627 T2 / #618 规格 §3，决议 A：与
-// useChatStore 同级 Pinia store，不扩进 chatStore）。树数据（tree）与 tab 数据同住本 store：二者同属
-// 「文件面板」关注点、同 per-container 生命周期（切容器树重拉 + tab 清空），合住避免再开一 store。
+// fileTabs store —— 会话沙箱 lab 树数据 + 只读文件 tab 状态机（#626 T1 / #627 T2 / #618 规格 §3，
+// 决议 A：与 useChatStore 同级 Pinia store，不扩进 chatStore）。#793 story 61 数据源换轨：树数据
+// 从「容器 workspace」改「当前会话沙箱 lab」（root=lab，:name 段 = sessionId）——**生命周期差异**：
+// lab 随会话生灭（workspace 曾随容器持久），切会话即 reset（树重拉 + tab 清空）。
+// 树数据（tree）与 tab 数据同住本 store：二者同属「文件面板」关注点、同 per-session 生命周期。
 //
-// T1：手动浏览端到端（树点击开只读 tab、切会话/容器清空）。
-// T2：agent live 工具事件自动弹 tab（onToolEvent，handleTool 单点调）+ pending 骨架 → done 拉全文 + 行级
-// 高亮（loadAndHighlight）→ error 收起 pending（closeIfPending）。历史路径不经 handleTool（extractToolRows
-// result 恒 null），故天然不开 tab（决议 B，无额外代码）。容器名经 useChatStore().selectedContainer 取。
+// T1：手动浏览端到端（树点击开只读 tab、切会话清空）。
+// T2：agent live 写工具事件自动弹 tab（onToolEvent，useChatSession bridgeFileTabs 单点调）+ pending
+// 骨架 → done 拉全文 + 行级高亮（loadAndHighlight）→ error 收起 pending（closeIfPending）。历史回放
+// 路径不经 onToolEvent，天然不开 tab（决议 B，无额外代码）。会话 id 经 useChatStore().selectedSession 取。
 import { defineStore } from 'pinia'
 import { useChatStore } from '@/stores/chat'
 import { ApiError } from '@/api/client'
-import { listWorkspaceTree, readWorkspaceFile, type DirListing, type FileReading } from '@/api/files'
+import { listLabTree, readLabFile, type DirListing, type FileReading } from '@/api/files'
 import { resolveToolCallKind, resolveToolCallTargetPaths, readEditPairs } from '@/chat/toolRender/tool-call-view'
 import { buildWriteDiffLines } from '@/chat/toolRender/tool-call-diff'
 import { parsePatchView } from '@/chat/toolRender/tool-call-patch'
@@ -35,8 +37,8 @@ function describeError(e: unknown): string {
 
 // ---- 行级高亮定位纯函数（best-effort + 优雅降级；规格 §5）----
 
-// workspace 相对路径：非空、非绝对（agent 偶发传 /abs/path 不属 workspace 树，跳过免污染 tab）
-function isWorkspaceRel(p: unknown): p is string {
+// lab 相对路径：非空、非绝对（agent 偶发传 /abs/path 不属 lab 树，跳过免污染 tab）
+function isLabRel(p: unknown): p is string {
   return typeof p === 'string' && p.length > 0 && !p.startsWith('/')
 }
 
@@ -129,20 +131,21 @@ export const useFileTabsStore = defineStore('fileTabs', {
     activePath: null as string | null,
   }),
   actions: {
-    // 拉 workspace 递归树（切到「文件」分段 / 容器变更触发）。中途切容器丢弃迟到响应。
+    // 拉 lab 递归树（切到「文件」分段 / 会话变更触发）。中途切会话丢弃迟到响应。
+    // 沙箱未建（纯浏览无执行会话）→ 50002/20040：降级空树 + 错误文案，不炸分段。
     async loadTree(): Promise<void> {
       const chat = useChatStore()
-      const name = chat.selectedContainer
-      if (!name) return
+      const sessionId = chat.selectedSession
+      if (!sessionId) return
       this.treeLoading = true
       this.treeError = null
       try {
-        const listing = await listWorkspaceTree(name)
-        if (chat.selectedContainer !== name) return // 切走了：丢弃旧容器响应
+        const listing = await listLabTree(sessionId)
+        if (chat.selectedSession !== sessionId) return // 切走了：丢弃旧会话响应
         this.tree = listing
         this.treeTruncated = listing.truncated
       } catch (e) {
-        if (chat.selectedContainer !== name) return
+        if (chat.selectedSession !== sessionId) return
         this.tree = null
         this.treeError = describeError(e)
       } finally {
@@ -170,14 +173,14 @@ export const useFileTabsStore = defineStore('fileTabs', {
 
     // 无高亮拉取已存在 tab 的全文（openFromTree 首载 + #628 T3 retry 的 tree 开路分支共用；与
     // loadAndHighlight 的差异仅在 lineMarks）。成功 → loaded + content；失败 → error + errorMessage。
-    // await 中途切容器 / 用户关 tab → 静默丢弃。
+    // await 中途切会话 / 用户关 tab → 静默丢弃。
     async loadPlain(path: string): Promise<void> {
       const chat = useChatStore()
-      const name = chat.selectedContainer
-      if (!name) return
+      const sessionId = chat.selectedSession
+      if (!sessionId) return
       try {
-        const fr = await readWorkspaceFile(name, path)
-        if (chat.selectedContainer !== name) return // 切走了：丢弃旧容器响应
+        const fr = await readLabFile(sessionId, path)
+        if (chat.selectedSession !== sessionId) return // 切走了：丢弃旧会话响应
         const tab = this.tabs.find((t) => t.path === path)
         if (!tab) return // await 中途用户已关掉 → 静默丢弃
         tab.content = fr.content
@@ -186,7 +189,7 @@ export const useFileTabsStore = defineStore('fileTabs', {
         tab.state = 'loaded'
         tab.errorMessage = undefined
       } catch (e) {
-        if (chat.selectedContainer !== name) return
+        if (chat.selectedSession !== sessionId) return
         const tab = this.tabs.find((t) => t.path === path)
         if (!tab) return
         tab.state = 'error'
@@ -204,13 +207,13 @@ export const useFileTabsStore = defineStore('fileTabs', {
       else await this.loadPlain(path)
     },
 
-    // onToolEvent —— live 工具事件唯一入口（handleTool 单点调；决议 A）。自筛 kind∈{edit,write}（决议 C：
-    // apply_patch 经 resolveToolCallKind 归 edit 故覆盖；read/search/command/fetch 不弹）+ workspace 相对
-    // 路径 + dedupe；按 state 分派。历史路径（extractToolRows）不经此，天然不开 tab（决议 B）。
+    // onToolEvent —— live 写工具事件唯一入口（useChatSession.bridgeFileTabs 单点调；决议 A）。
+    // 自筛 kind∈{edit,write}（决议 C：apply_patch 经 resolveToolCallKind 归 edit 故覆盖；
+    // read/search/command/fetch 不弹）+ lab 相对路径 + dedupe；按 state 分派。
     onToolEvent(tool: { name: string; state: 'running' | 'done' | 'error'; input: unknown; result: unknown }): void {
       const kind = resolveToolCallKind(tool.name, tool.input)
       if (kind !== 'edit' && kind !== 'write') return
-      const paths = resolveToolCallTargetPaths(tool.name, tool.input).filter(isWorkspaceRel)
+      const paths = resolveToolCallTargetPaths(tool.name, tool.input).filter(isLabRel)
       if (paths.length === 0) return
       const seen = new Set<string>()
       for (const path of paths) {
@@ -234,13 +237,13 @@ export const useFileTabsStore = defineStore('fileTabs', {
     // 或用户关 tab → 静默丢弃。binary/oversized → loaded + content:null + []（查看器出空态）。
     async loadAndHighlight(path: string, input: unknown, kind: 'edit' | 'write'): Promise<void> {
       const chat = useChatStore()
-      const container = chat.selectedContainer
-      if (!container) return
+      const sessionId = chat.selectedSession
+      if (!sessionId) return
       let fr: FileReading
       try {
-        fr = await readWorkspaceFile(container, path)
+        fr = await readLabFile(sessionId, path)
       } catch (e) {
-        if (chat.selectedContainer !== container) return // 切走了：丢弃旧容器回填
+        if (chat.selectedSession !== sessionId) return // 切走了：丢弃旧会话回填
         const tab = this.tabs.find((t) => t.path === path)
         if (!tab) return // await 中途用户已关掉 → 静默
         // 记 agent 开路上下文：error 态重试按钮据此复刻高亮（#628 T3；仅 fetch 失败时种值）
@@ -253,7 +256,7 @@ export const useFileTabsStore = defineStore('fileTabs', {
         tab.errorMessage = describeError(e)
         return
       }
-      if (chat.selectedContainer !== container) return
+      if (chat.selectedSession !== sessionId) return
       const tab = this.tabs.find((t) => t.path === path)
       if (!tab) return
       tab.binary = fr.binary
@@ -283,13 +286,13 @@ export const useFileTabsStore = defineStore('fileTabs', {
       }
     },
 
-    // 清全部 tab + active（保留 tree）—— 切会话语义（基线 6「切会话清空」+ 树是 per-container 保留）
+    // 清全部 tab + active（保留 tree）—— 会话内清 tab 语义
     closeAll(): void {
       this.tabs = []
       this.activePath = null
     },
 
-    // 全清（含 tree）—— 切容器语义（基线 3「切容器重拉」：tree 清空后下次进「文件」分段触发 loadTree）
+    // 全清（含 tree）—— 切会话语义（lab 随会话生灭：tree 清空后下次进「文件」分段触发 loadTree）
     reset(): void {
       this.tabs = []
       this.activePath = null

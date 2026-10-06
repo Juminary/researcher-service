@@ -114,7 +114,11 @@ OpenClaw 容器 fleet (openclaw-gw-<name>，每容器独立 home/openclaw.json/�
   GET 历史投影（回放零差异面；#781 起 archivedAt 过滤——被放弃路线行不可读）；`/<id>/abort`、
   `/<id>/resume`；#781 增 `/<id>/rewind`（换 activeCheckpointId 指针重开 + 被放弃路线软删 +
   `session.invalidated{reason:rewind}` 事件）、`/<id>/fork`（新会话复制全件 + 沙箱字面复制 +
-  `session.created{source:fork}` 事件）；50002 同码防探测）。
+  `session.created{source:fork}` 事件）；#782 增 rewind body `scope` 三态（`all` 缺省=对话+文件
+  同回[逆放 /lab 至锚点时刻]·`chat`=只回对话[水位推进保持文件现状]·`files`=只回文件[对话投影与
+  指针不动]；files 面结果挂 `files` 字段{reverted,skippedMissing,degraded}）+ `/<id>/rewind/preview`
+  （逆放摘要 + 锚后 exec 跨越清单——POST 同 body，只读）；
+  50002 同码防探测）。
 - `/api/v1/containers/<name>/chat/{sessions,approval/resolve,commands}` — chat REST 代理。
 - 对话 WS 走 `/ws/chat/` 隧道（JWT subprotocol 握手；先 accept 再 close(4401) 拒未认证）。
 - `GET /api/v1/events` — SSE 事件流（#773，panel_stream cookie 认证，替代 WS 的传输面先行）。
@@ -129,7 +133,8 @@ OpenClaw 容器 fleet (openclaw-gw-<name>，每容器独立 home/openclaw.json/�
 maxConcurrentRuns 或全局 RUNNER_MAX_CONCURRENT_RUNS]）· `5xxxx` chat/pairing 的 WS close codes 为另一传输面；信封面 5xxxx = 会话/run 域（#747 C 节，
   #776 起 50002 session_not_found；#777 起 50003 审批挂起（#778 补 REST 前置面与码表）；#783 起
   50004 approval_not_found 同码防探测；#778 增（50004 让位 #783，顺移起）50005 run 进行中禁输入·
-  非终态拒删 / 50006 无在飞可中断 / 50007 幂等 key 同 key 异 content）· `6xxxx` files ·
+  非终态拒删 / 50006 无在飞可中断 / 50007 幂等 key 同 key 异 content；#782 起 50008 文件状态
+  重放中[写围栏等待超时，报当前持有者]）· `6xxxx` files ·
 `7xxxx` figures（AutoFigure，70040 不存在/越权同码防探测（T05 读路径，PNG 复用同一归属门）· 70041 幂等冲突 ·
 70042 PNG 未就绪（queued/running）· 70043 PNG 不可用（failed/产物缺失））·
 `9xxxx` 系统/校验。
@@ -138,14 +143,23 @@ maxConcurrentRuns 或全局 RUNNER_MAX_CONCURRENT_RUNS]）· `5xxxx` chat/pairin
 
 - `router/index.ts` — 路由表 + 导航守卫（未登录重定向 `/login`，`auth.hydrate()` 恢复登录态；
   `meta.requiresAdmin` 守卫 admin users 页）。
-- `stores/` — Pinia：`auth.ts`（JWT access token + role/mustChangePassword）、`wiki.ts`、`chatStore.ts`。
-- `api/` — REST client 封装（`client.ts` 信封解析 + 401 刷新链 + 并发去抖；`chat/containers/wiki/models/users.ts` 按域）。
-- `chat/` — 网关直连协议机（官方 `@openclaw/gateway-client` 浏览器端）：`gatewayChat.ts` /
-  `useChatConnection.ts`（composable）/ `eventTranslate.ts`（纯函数翻译）/ `restOutbox.ts`
-  （#779 story 12 REST 断线排队纯逻辑：sessionStorage 落盘、50 上限丢最旧、按序幂等 flush——接线归 #793）。
-- `views/` — 六页：`LoginView` / `ContainersView` / `ChatView` / `WikiView` / `ModelView` / `AdminUsersView`。
+- `stores/` — Pinia：`auth.ts`（JWT access token + role/mustChangePassword）、`wiki.ts`、`chat.ts`
+  （对话页响应式投影：纯 mutation；视图模型类型经 `chat/projection.ts` 再导出）、`fileTabs.ts`
+  （会话沙箱 lab 文件 tab，#793 起 root=lab、切会话即换树）。
+- `api/` — REST client 封装（`client.ts` 信封解析 + 401 刷新链 + 并发去抖；`sessions/containers/files/wiki/models/users.ts` 按域）。
+- `chat/` — chat 核心三件套（#793 · #730 §4.1，REST+SSE 换轨；网关协议机/设备配对/升级编排死区已删）：
+  `projection.ts`（投影归约器纯函数——`applyEvent` 事件增量 / `fromProjection` 投影行双入口同形状，
+  事件聚合语义镜像 server sessions/reducer.ts，一致性由 projection.test.ts 零差异组锁死）/
+  `useChatSession.ts`（会话编排 composable——发送幂等/门控/断线补偿/审批/slash 系统命令）/
+  `useEventStream.ts`（SSE 薄封装——原生重连 + seq gap 检测 + 401 经刷新链关流 + session.terminated 停重连）/
+  `restOutbox.ts`（#779 story 12 断线排队：sessionStorage 落盘、50 上限丢最旧、按序幂等 flush）/
+  `attachments.ts`（采集/校验纯函数，发送经 multipart 上传换 attachmentIds）；
+  `teamProjection.ts`（#786 teammate 投影，TeamSessionsView 用）。
+- `views/` — 六页：`LoginView` / `ContainersView` / `ChatView`（REST+SSE 编排壳）/ `WikiView` / `ModelView` / `AdminUsersView`。
 - `components/` — `FileTree` / `MdEditor`（Typora 式实时渲染）/ `WikiGraph`（obsidian 风格图谱）/
-  ChatView 8 组件（`ChatSidebar`/`ChatHeader`/`ChatStream`/`ChatComposer`/`ChatMessageItem`/`ThinkingCard`/`ToolLine`/`ApprovalCard`）。
+  ChatView 哑组件族（props-in/emits-out，零协议 import：`ChatSidebar`（会话扁平列表 + lab 文件树）/
+  `ChatHeader`/`ChatStream`/`ChatComposer`/`ChatMessageItem`/`ThinkingCard`/`ToolLine`/`ApprovalCard`/`ApprovalDock`
+  + `SessionTimeline`/`SessionTurn`（teammate 面））。
 
 ## 关键机制与约束
 

@@ -372,6 +372,19 @@ function readRunnerRecursionLimit(): number {
   return v
 }
 
+// FILE_JOURNAL_*（#782）共用读面：正整数 fail-fast（对齐 readRunnerMaxConcurrentRuns 加载即校验）。
+function readPositiveEnvInt(name: string, fallback: number): number {
+  const v = Number(process.env[name] ?? fallback)
+  if (!Number.isInteger(v) || v <= 0 || v > 1_000_000_000) {
+    throw new Error(`${name} 非法: ${JSON.stringify(process.env[name])}，须为正整数`)
+  }
+  return v
+}
+
+function readPositiveEnvBytes(name: string, fallbackMb: number): number {
+  return readPositiveEnvInt(name, fallbackMb) * 1024 * 1024
+}
+
 // SANDBOX_IMAGE（#776）：会话沙箱镜像——最小闭环先用 busybox（含 sh/timeout 基础 applet，
 // runner backend 超时 kill 机制的镜像前提，values.ts EXEC_DEFAULT_TIMEOUT_MS 注释同源）；完整
 // 工具链镜像（bash/git/Python3/Node/rg/curl/jq/…）随 #784 钉版更换默认。生产浮动引用
@@ -528,6 +541,13 @@ export const config = {
       },
       // 审批升级超时（729 §3.3 默认 48h；装配层注入 RunService）
       approvalTimeoutMs: readApprovalTimeoutMs(),
+      // 文件 rewind 机制（#782 · #766 D8）：attic per-session 配额（对称 100MB checkpoint
+      // 护栏纪律）/ 逆放深度上限（超限降级「对话照回退、文件保持现状」）/ 稳态写围栏有界等待。
+      fileJournal: {
+        quotaBytes: readPositiveEnvBytes('FILE_JOURNAL_ATTIC_QUOTA_MB', 100),
+        depthLimit: readPositiveEnvInt('FILE_JOURNAL_REPLAY_DEPTH_LIMIT', 1000),
+        fenceTimeoutMs: readPositiveEnvInt('FILE_JOURNAL_FENCE_TIMEOUT_MS', 30_000),
+      },
       // #785 写锁有界等待（默认 10s；装配层注入 RunService；env RUNNER_WRITE_LOCK_TIMEOUT_MS）
       writeLockTimeoutMs: readWriteLockTimeoutMs(),
     }

@@ -1,9 +1,10 @@
-// files API —— workspace 文件树 + 单文件只读全文（#626 T1 / #618 规格 §1）。
-// 直读控制面 files REST（#586/#589 已就绪）：listWorkspaceTree 递归拉全量树、readWorkspaceFile 拉单文件全文。
-// 走 apiJson（自动 #312 信封解包 + 401 刷新链，client.ts:112）。v1 只读——tabs 不回写，不实现 PUT/POST/DELETE。
+// files API —— 沙箱 lab 文件树 + 单文件只读全文（#776 root 契约 / #793 story 61 侧栏文件 tab）。
+// root=lab：:name 段传 **sessionId**（服务端派生 researcher-sandbox-<sessionId>），lab 随会话生灭
+//（#730 §4.7 生命周期差异：切会话即换树）。只读 GET 面——写面仅 legacy wiki root 放行，lab 写 → 90002。
+// 走 apiJson（自动 #312 信封解包 + 401 刷新链，client.ts）。v1 只读——tabs 不回写，不实现 PUT/POST/DELETE。
 //
-// 镜像类型与 server/src/files/fsPort.ts:13-40 逐字段对齐（前端本地定义，不 import server 类型——
-// 对齐 api/containers.ts:4-20 / api/wiki.ts 的本地 DTO 惯例）。
+// 镜像类型与 server/src/files/fsPort.ts 逐字段对齐（前端本地定义，不 import server 类型——
+// 对齐 api/containers.ts / api/wiki.ts 的本地 DTO 惯例）。
 import { apiJson } from '@/api/client'
 
 export interface FileEntry {
@@ -31,16 +32,17 @@ export interface FileReading {
   oversized: boolean
 }
 
-// 树：一次拉全量 workspace 嵌套（基线 3：recursive=true，10k 上限 truncated 时树底提示）
-export function listWorkspaceTree(name: string): Promise<DirListing> {
+// 树：一次拉全量沙箱 /lab 嵌套（recursive=true，10k 上限 truncated 时树底提示）。
+// 前置：会话已有沙箱（惰性创建——首次上传/首次执行触发；纯浏览空沙箱会话 → 服务端 50002/20040 由调用方降级空态）。
+export function listLabTree(sessionId: string): Promise<DirListing> {
   return apiJson<DirListing>(
-    `/api/v1/containers/${encodeURIComponent(name)}/files?root=workspace&recursive=true`,
+    `/api/v1/containers/${encodeURIComponent(sessionId)}/files?root=lab&recursive=true`,
   )
 }
 
-// 单文件全文（树点击开只读 tab 时拉；后续 agent 自动弹 tab 票 result 后亦走此拉全文）
-export function readWorkspaceFile(name: string, relPath: string): Promise<FileReading> {
+// 单文件全文（树点击开只读 tab 时拉；agent 写工具 done 后自动弹 tab 亦走此拉全文）
+export function readLabFile(sessionId: string, relPath: string): Promise<FileReading> {
   return apiJson<FileReading>(
-    `/api/v1/containers/${encodeURIComponent(name)}/files?root=workspace&path=${encodeURIComponent(relPath)}`,
+    `/api/v1/containers/${encodeURIComponent(sessionId)}/files?root=lab&path=${encodeURIComponent(relPath)}`,
   )
 }

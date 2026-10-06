@@ -7,7 +7,11 @@
 # ---- build：编译 ----
 FROM node:lts-slim AS build
 
-WORKDIR /app
+# 构建布局必须复刻仓库兄弟目录形态（hotfix #788 CD）：plugins/index.ts 经跨包相对导入
+# '../server/src/plugins/api' 引契约类型（#752 R1 双面直引的固有形态，#753 的插件 manifest
+# 同理），content:build 亦按 '../official' 兄弟解析——故 server 根 = /server，official/plugins
+# 两个 named context 分别挂 /official、/plugins（与 WORKDIR 成兄弟）。
+WORKDIR /server
 # better-sqlite3 原生模块（node-gyp）在 build 阶段 npm ci 的 postinstall 编译工具链。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential python3 \
@@ -51,10 +55,11 @@ RUN npm ci --omit=dev
 
 # 编译产物 + prisma generate 生成物（tsc 编译产物树含 dist/server/src/generated，显式双拷贝
 # 保证完整；client 纯 JS，体积可忽略）。schema/scripts 供 entrypoint 幂等落表。
-COPY --from=build /app/dist ./dist
-COPY --from=build /app/src/generated ./src/generated
-COPY --from=build /app/prisma ./prisma
-COPY --from=build /app/scripts ./scripts
+# 源路径 = build 阶段 WORKDIR /server（兄弟布局 hotfix，见上）。
+COPY --from=build /server/dist ./dist
+COPY --from=build /server/src/generated ./src/generated
+COPY --from=build /server/prisma ./prisma
+COPY --from=build /server/scripts ./scripts
 
 # ADR 0013（issue #593）：home 模板与 openclaw.json 构建期入镜像——生产不再挂载任何宿主数据
 # 路径（唯一豁免 docker.sock）。两处 COPY 的源是 buildx 多 context（CD 经 build-contexts 注入：

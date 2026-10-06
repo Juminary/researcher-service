@@ -11,8 +11,7 @@ vi.mock('@/api/containers', () => ({
   listInstances: vi.fn(),
   createInstance: vi.fn(),
   removeInstance: vi.fn(),
-}))
-vi.mock('@/api/chat', () => ({
+  // #793：配对面自 api/chat.ts 移入 api/containers.ts，mock 随迁
   triggerPair: vi.fn(),
 }))
 vi.mock('element-plus', async (importOriginal) => {
@@ -25,8 +24,7 @@ vi.mock('element-plus', async (importOriginal) => {
 })
 
 import ContainersView from '@/views/ContainersView.vue'
-import { createInstance, listInstances, removeInstance } from '@/api/containers'
-import { triggerPair } from '@/api/chat'
+import { createInstance, listInstances, removeInstance, triggerPair } from '@/api/containers'
 
 const SAMPLE = {
   name: 'demo',

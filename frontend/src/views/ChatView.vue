@@ -1,33 +1,25 @@
 <script setup lang="ts">
 defineOptions({ name: 'ChatView' })
-// 对话页编排壳（#316 候选 B / #340：#316 拆分定案——8 组件边界，本文件只做编排）。
-// 连接生命周期 × runId 路由 × 消息投影的非响应式簇全在 useChatConnection（composable 闭包）；
-// 响应式投影（messages/approvals/sessions/commands/输入）在 chatStore（纯 mutation）；
-// 8 个展示组件全 props-in/emits-out 哑组件（ChatSidebar/ChatHeader/ChatStream/ChatComposer +
-// ChatMessageItem/ThinkingCard/ToolLine/ApprovalCard），6 slot 全开（msg-item/thinking/tool-line/
-// empty/slash-menu/banner——#399 起审批卡并入 ChatStream 合并时间线渲染，approvals slot 删除），
-// 表现父注入、逻辑留宿主。
-// 行为与拆分前一致：同 wire（隧道 + 官方协议机）、同 reconnect（4401 刷新重建/退避重连）、同 ping/pong。
+// 对话页编排壳（#316 候选 B / #340：8 组件边界，本文件只做编排）。
+// #793 chat 核心重写（#730 主骨架）：接线从网关协议机换轨 REST+SSE 三件套——
+//   useEventStream（SSE 传输）+ chat/projection（投影归约器）+ useChatSession（会话编排）；
+// 响应式投影（messages/approvals/sessions/输入）在 chatStore（纯 mutation）；8 个展示组件全
+// props-in/emits-out 哑组件，6 slot 全开（msg-item/thinking/tool-line/empty/slash-menu/banner），
+// 表现父注入、逻辑留宿主。容器维度退役（#730 §4.7）：无容器切换器/升级编排——侧栏 = 会话列表
+//（扁平挂用户，story 4）+ 沙箱 lab 文件树（story 61）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listInstances, upgradeInstance } from '@/api/containers'
-import { ApiError } from '@/api/client'
-import { useChatStore, type Msg } from '@/stores/chat'
+import { uploadSessionAttachment } from '@/api/sessions'
+import type { SystemCommandResult } from '@/api/sessions'
+import { useChatStore } from '@/stores/chat'
 import { useFileTabsStore } from '@/stores/fileTabs'
 import { useAuthStore, tokenOwner } from '@/stores/auth'
 import { safeLocalStorage } from '@/storage'
-import { useChatConnection } from '@/chat/useChatConnection'
+import { useChatSession, type SentAttachment } from '@/chat/useChatSession'
 import { INLINE_RANGE_NARROW, INLINE_RANGE_WIDE } from '@/panels/triState'
 import { usePanelGroup } from '@/panels/usePanelGroup'
 import { usePanelTriState } from '@/panels/usePanelTriState'
 import PanelTriState from '@/components/PanelTriState.vue'
-import { useContainerUpgrade } from '@/chat/useContainerUpgrade'
-import {
-  UPGRADE_BANNER_TEXT,
-  UPGRADE_FAILED_DETAIL,
-  UPGRADE_FAILED_TITLE,
-  upgradeDecision,
-} from '@/containers/upgradeGate'
 import {
   buildAttachments,
   compressImageFile,
@@ -46,8 +38,7 @@ import FileTabsPanel from '@/components/chat/FileTabsPanel.vue'
 
 const chat = useChatStore()
 const auth = useAuthStore()
-// 视图专属态（connecting/errorMsg 上抛至此，disconnected 在 composable 内）
-const connecting = ref(false)
+// 视图专属态（errorMsg 上抛至此；connecting/disconnected/lastRunError/run 在 composable 内）
 const errorMsg = ref('')
 
 // #671 / #672：本页三态面板组（每页一个实例，非模块级单例）——左栏与右侧文件预览共用一组，
@@ -107,17 +98,17 @@ const {
   onDragEnd: onFilePanelDragEnd,
 } = filePreviewPanel
 
-// #626 T1：左栏「会话｜文件」分段态（视图专属，默认「会话」）+ workspace 文件 tab store（决议 A：与 chatStore 同级）
+// #626 T1：左栏「会话｜文件」分段态（视图专属，默认「会话」）+ lab 文件 tab store（决议 A）
 const sidebarTab = ref<'sessions' | 'files'>('sessions')
 const fileTabs = useFileTabsStore()
-// 切到「文件」分段：树未加载则拉一次（同容器切回不重拉）；切容器：reset 已清树，在 files 分段时重拉
+// 切到「文件」分段：树未加载则拉一次；切会话：fileTabs.reset 已清树，在 files 分段时重拉
 watch(sidebarTab, (tab) => {
-  if (tab === 'files' && chat.selectedContainer && !fileTabs.tree && !fileTabs.treeLoading) {
+  if (tab === 'files' && chat.selectedSession && !fileTabs.tree && !fileTabs.treeLoading) {
     void fileTabs.loadTree()
   }
 })
-watch(() => chat.selectedContainer, (name) => {
-  if (sidebarTab.value === 'files' && name) void fileTabs.loadTree()
+watch(() => chat.selectedSession, (id) => {
+  if (sidebarTab.value === 'files' && id) void fileTabs.loadTree()
 })
 function switchSidebarTab(tab: 'sessions' | 'files'): void {
   sidebarTab.value = tab
@@ -126,172 +117,114 @@ function activateTab(path: string): void {
   fileTabs.activePath = path
 }
 
-const conn = useChatConnection({
-  onConnecting(v: boolean) {
-    connecting.value = v
-  },
+// ---- 会话编排（三件套之三）----
+const conn = useChatSession({
   onError(message: string) {
     errorMsg.value = message
   },
   onClearError() {
     errorMsg.value = ''
   },
-  // #694（Spec 轴 review）：动作类失败（用户主动发起的回退）走瞬时 toast，不进顶部连接横幅——
-  // 横幅 label 恒「加载失败」，把「回退失败：…」套在其下语义相左；贴 #461 删除会话失败 toast 先例。
+  // 动作类失败走瞬时 toast，不进顶部连接横幅（贴 #461 删除会话失败 toast 先例）。
   onActionError(message: string) {
     ElMessage.error(message)
   },
-  // #459-T2 #463 #1：Enter/斜杠发送统一走 sendMessage（含附件校验/清空预览条），与发送按钮同路径。
+  // Enter/斜杠发送统一走 sendMessage（含附件校验/清空预览条），与发送按钮同路径。
   // 箭头闭包延迟求值——sendMessage 为 function 声明提升，Enter 触发时 conn 已就绪。
   onSend() {
     void sendMessage()
   },
-  // #694 回退编排的 composer 协同（#693 spec §1.4）：草稿（文本 + 附件）归本壳，composable 经这两个
-  // 回调抓指纹 / 回填——直接引用两个函数声明（提升，rewind 触发时 pendingAttachments 已就绪），
-  // 不再经一层转手。
-  onRewindDraftFingerprint: draftFingerprint,
-  onEntryBackfill: applyEntryBackfill,
+  // 系统命令结果：/new → 选中服务端新建的会话；/model → 提示当前生效面。
+  onCommand(cmd: SystemCommandResult) {
+    if (cmd.name === 'new' && cmd.sessionId) {
+      conn.selectSession(cmd.sessionId)
+      ElMessage.success('已新建会话')
+      return
+    }
+    if (cmd.name === 'model') {
+      const m = cmd.model
+      ElMessage.success(m ? `下一条消息起使用模型 ${m.modelId}` : '未指定模型，沿用面板默认')
+    }
+  },
 })
-
-// #702 惰性升级：打开容器前先过纯决策（containers/upgradeGate.upgradeDecision）——需升级则触发 +
-// 轮询（期间绝不建网关连接，杜绝容器停机期的重连风暴），收敛到可连态再回填 onConnectable 自动恢复
-// 对话；upgrade_failed 终态只透出文案、不触发不轮询。宿主只做接线，无散乱 if。
-const upgrade = useContainerUpgrade({
-  fetch: listInstances,
-  trigger: upgradeInstance,
-  onConnectable: (name) => void conn.selectContainer(name),
-})
-
-// 打开容器的唯一入口（侧栏选择 / 首次挂载自动选中 / defineExpose 全走此门）：
-// 无需升级 → 直接建连（既有行为不变）；否则交升级编排接管，连接由编排在收敛后自行发起。
-async function openContainer(name: string): Promise<void> {
-  if (!name) return
-  // 先用已缓存的列表事实做同步判定（mount 时 loadInstances 已灌 chat.instances）：无需升级的
-  // 常见路径不额外发请求、不改变既有建连时序；升级相关路径才交给编排去拉最新状态。
-  const cached = chat.instances.find((i) => i.name === name)
-  if (upgradeDecision({ status: cached?.status, needsUpgrade: cached?.needs_upgrade }).kind === 'connect') {
-    await conn.selectContainer(name)
-    return
-  }
-  await upgrade.open(name)
-}
-
 // 嵌套 ref 在模板中不解包（conn 是普通对象）——顶层解构后模板自动解包（slash 匹配单一来源在
-// useChatConnection，此处只消费）
+// useChatSession，此处只消费）
 const slashOpen = conn.slashOpen
 const slashMatches = conn.slashMatches
+const connecting = conn.connecting
 
 const currentSessionTitle = computed(() => {
-  const s = chat.sessions.find((x) => x.session_key === chat.selectedSession)
-  return s?.title || (s ? s.session_key.slice(0, 8) : '') || ''
+  const s = chat.sessions.find((x) => x.id === chat.selectedSession)
+  return s?.title || (s ? s.id.slice(0, 8) : '') || ''
 })
 
-// 是否有助手消息正在流式；并发 send 会让旧 streaming 消息永久卡住光标，故流式中禁发
-const streaming = computed(() => chat.messages.some((m) => m.role === 'assistant' && m.streaming))
+// 是否有在飞 run（流式 overlay）——发送门控 + 中断按钮 + 执行状态行（story 8 前端面）
+const running = conn.running
 
-// #694 回退入口的渲染门（#693 spec §1.5 官方同构 + Codex #703 P1 修订）：网关支持会话控制
-//（hello-ok features 快照）且不在忙碌态时才渲染。忙碌态 = 流式 / 连接中 / 已断线（复用三态）
-// + 回退自身在途（rewindBusy：窗口内投影还是旧代，重入即被编排层吞掉）+ 投影未同步
-//（transcriptSynced：重连后 syncSessions 落地前，可见的是断线前的陈旧条目——此刻回退可能剪除
-// 用户未见的更新轮次；fail-closed，同步失败保持隐藏直至下次权威 loadHistory）。
-const rewindAvailable = computed(
-  () =>
-    conn.sessionControlAvailable.value &&
-    conn.transcriptSynced.value &&
-    !conn.rewindBusy.value &&
-    !conn.forkBusy.value &&
-    !streaming.value &&
-    !connecting.value &&
-    !conn.disconnected.value,
-)
-
-// #697 fork 入口的渲染门：与回退共享能力门 / 投影权威门 / 忙碌三态，另与回退在途互斥
-//（rewindBusy 与 forkBusy 双向——两者同动 transcript，同时进行 = 网关侧乐观并发冲突）。
-const forkAvailable = computed(
-  () =>
-    conn.sessionControlAvailable.value &&
-    conn.transcriptSynced.value &&
-    !conn.rewindBusy.value &&
-    !conn.forkBusy.value &&
-    !streaming.value &&
-    !connecting.value &&
-    !conn.disconnected.value,
-)
-
-// #694 回退入口 emit（ChatStream→消息携带）：取网关条目 id 发起编排（无 id 时入口本就不渲染，防御性早退）。
-function rewind(msg: Msg): void {
-  if (!msg.entryId) return
-  void conn.rewind(msg.entryId)
-}
-
-// #697 fork 入口 emit：同 rewind 取 entryId 发起编排。
-function fork(msg: Msg): void {
-  if (!msg.entryId) return
-  void conn.fork(msg.entryId)
-}
-  
-// #698 分支菜单 busy 门（#706 词汇「会话控制能力」四合一套件同族）：忙碌态禁用而非隐藏——顶栏
-// 按钮闪现会推挤布局（与消息级入口的隐藏形态有意分歧）；transcriptSynced 关门（重连同步窗口内
-// 分支列表可能陈旧，fail-closed）。渲染门（length > 1）在 ChatHeader 哑组件内单点判定。
-const branchMenuBusy = computed(
-  () =>
-    conn.rewindBusy.value ||
-    conn.forkBusy.value ||
-    !conn.transcriptSynced.value ||
-    streaming.value ||
-    connecting.value ||
-    conn.disconnected.value,
-)
-
-// #698 分支切换 emit：无确认直接切换（#693 spec §1.4）
-function branchSwitch(leafEntryId: string): void {
-  void conn.switchBranch(leafEntryId)
-}
-
-// #405-T1：审批卡可见性过滤归 chatStore getter（#395 钉死 + #394 实测——当前会话是 subagent
-// 会话时审批区恒空；非 subagent 会话显示归属卡 + 无 sessionKey 连接级卡 + subagent 卡；
-// 被过滤卡留存列表仅渲染层隐藏）
-const visibleApprovals = computed(() => chat.visibleApprovals)
-// #405-T2：是否有待展示审批卡——驱动 ChatStream 在 main 会话无 assistant 消息时合成
-// SyntheticAnchor 虚拟气泡承载审批卡（锚定三分支之外的稳定落点；卡全 resolved 后仍留存）
+// 连接/加载横幅 + 错误分类红显（story 10：llm_error/recursion_limit/infra）。
+// run.error 横幅独立于连接横幅——run 失败不等于连接失败；进行态装饰随下次 run/切会话剥落。
 const connectionState = computed(() => {
-  if (connecting.value) return { tone: 'info', label: '正在连接…', detail: '' }
-  if (conn.disconnected.value) return { tone: 'danger', label: '连接已断开', detail: errorMsg.value }
-  if (errorMsg.value) return { tone: 'danger', label: '加载失败', detail: errorMsg.value }
+  if (connecting.value) return { tone: 'info', label: '正在连接…', detail: '', test: 'connection-banner' }
+  if (conn.disconnected.value) return { tone: 'danger', label: '连接已断开', detail: errorMsg.value, test: 'reconnect-bar' }
+  if (errorMsg.value) return { tone: 'danger', label: '加载失败', detail: errorMsg.value, test: 'connection-banner' }
   return null
 })
 
 // #542：执行状态指示——与上方连接横幅互补，横幅只报连接态（正在连接/断开/加载失败），
 // 此行只反映「正在干活」的瞬时态；横幅可见时返回空串整行隐藏，不重复横幅文案。
+// story 8：在飞 run 时行内挂「中断」入口（REST POST /abort；50006 无在飞 → toast）。
 const executionStatus = computed(() => {
   if (connectionState.value) return ''
-  if (visibleApprovals.value.some((a) => a.status === 'pending')) return '等待批准'
+  if (chat.approvals.some((a) => a.status === 'pending')) return '等待批准'
+  if (running.value) return '模型正在回答…'
   if (chat.messages.some((m) => m.tools.some((t) => t.state === 'running'))) return '正在执行工具…'
-  if (streaming.value) return '模型正在回答…'
   return '已连接'
 })
 
 // #668：JWT 身份解析与 localStorage 安全访问收敛到共享实现（stores/auth.tokenOwner /
 // storage.safeLocalStorage），面板三态宽度持久化共用同一套隔离语义。
 function draftKey(session = chat.selectedSession): string {
-  return `researcher:draft:${tokenOwner(auth.token)}:${chat.selectedContainer}:${session}`
+  return `researcher:draft:${tokenOwner(auth.token)}:${session}`
 }
-watch(() => [chat.selectedContainer, chat.selectedSession] as const, () => {
-  if (chat.selectedContainer && chat.selectedSession) chat.setInput(safeLocalStorage()?.getItem(draftKey()) ?? '')
+watch(() => chat.selectedSession, () => {
+  if (chat.selectedSession) chat.setInput(safeLocalStorage()?.getItem(draftKey()) ?? '')
 })
 watch(() => chat.input, (value) => {
-  if (!chat.selectedContainer || !chat.selectedSession) return
+  if (!chat.selectedSession) return
   const storage = safeLocalStorage(); if (!storage) return
   if (value) storage.setItem(draftKey(), value); else storage.removeItem(draftKey())
 })
+
+// story 5 标题可改：改名牌（ChatHeader）→ 确认框 → PATCH /sessions/:id。
+async function renameSession(): Promise<void> {
+  if (!chat.selectedSession) return
+  try {
+    const { value } = await ElMessageBox.prompt('输入新的会话标题', '重命名会话', {
+      type: 'info',
+      inputValue: currentSessionTitle.value,
+      inputPattern: /\S/,
+      inputErrorMessage: '标题不能为空',
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+    })
+    await conn.renameSession(chat.selectedSession, value)
+  } catch {
+    // 用户取消
+  }
+}
+
 // #547 / ADR 0014：pending/resolving 请求固定在 composer 上方 ApprovalDock，避免被长回答顶出可视区域。
-// resolved/expired 卡不留痕（ADR 0014 supersede #547 的留痕意图）——落定即从界面消失，不回时间线。
+// resolved/expired 卡不留痕（ADR 0014）——落定即从界面消失，不回时间线。
 const activeApprovals = computed(() =>
-  visibleApprovals.value.filter((a) => a.status === 'pending' || a.status === 'resolving'),
+  conn.chat.visibleApprovals.filter((a) => a.status === 'pending' || a.status === 'resolving'),
 )
 
+function toggleApprovalDetail(a: { id: string }): void {
+  chat.toggleApprovalDetail(a.id)
+}
+
 // 删除会话：确认（ElMessageBox）由本壳注入（composable 内不持有 UI）。
-// #461：文案明示硬删除不可恢复（删除即硬删，无「归档/可恢复」中间态，与真实网关语义一致）。
+// #461：文案明示硬删除不可恢复（删除即硬删，级联删沙箱由服务端负责）。
 async function confirmRemoveSession(): Promise<boolean> {
   try {
     await ElMessageBox.confirm(
@@ -305,28 +238,25 @@ async function confirmRemoveSession(): Promise<boolean> {
   }
 }
 
-async function removeSession(key: string): Promise<void> {
-  const res = await conn.removeSession(key, confirmRemoveSession)
+async function removeSession(id: string): Promise<void> {
+  const res = await conn.removeSession(id, confirmRemoveSession)
   if (res === true) {
-    safeLocalStorage()?.removeItem(draftKey(key))
+    safeLocalStorage()?.removeItem(draftKey(id))
     ElMessage.success('会话已删除')
   }
-  else if (typeof res === 'string') ElMessage.error(res) // #461：失败 → 醒目错误 toast（替换顶部小字 bar）
-  // null = 用户取消 / 断线：无反馈
+  else if (typeof res === 'string') ElMessage.error(res) // #461：失败 → 醒目错误 toast
+  // null = 用户取消：无反馈
 }
 
-function toggleApprovalDetail(a: { id: string }): void {
-  chat.toggleApprovalDetail(a.id)
-}
-
-// ---- #459-T2 #463：附件采集（预览条状态归宿主，贴 connecting/errorMsg 先例——本地瞬态 UI 态）----
+// ---- 附件采集（预览条状态归宿主，贴 connecting/errorMsg 先例——本地瞬态 UI 态）----
 // 预览项 PendingAttachment（结构上提 attachments.ts 单一来源）= 采集到的 RawAttachment（content 纯
-// base64）+ 本地缩略 previewUrl（图片经 toPreviewDataUrl 重建 dataURL，免 objectURL 管理）；发送前经
-// buildAttachments 统一校验（类型/体积），拒发项提示、放行项发送。
+// base64）+ 本地缩略 previewUrl（图片经 toPreviewDataUrl 重建 dataURL）；发送前经 buildAttachments
+// 统一校验（类型/体积）→ 逐个上传（POST /sessions/:id/attachments）→ attachmentIds 随消息发送。
 const pendingAttachments = ref<PendingAttachment[]>([])
 let attachKey = 0
+let uploading = false
 
-// 预览条追加（单一入口）：采集三通道（粘贴/拖拽/选择）与 #694 回退回填共用同一落点——key 单调递增
+// 预览条追加（单一入口）：采集三通道（粘贴/拖拽/选择）共用同一落点——key 单调递增
 // （移除按钮按 key 定位）、图片经 toPreviewDataUrl 重建 dataURL 缩略。
 function pushAttachment(att: RawAttachment): void {
   pendingAttachments.value.push({ key: ++attachKey, att, previewUrl: toPreviewDataUrl(att) })
@@ -355,79 +285,75 @@ function removeAttachment(key: number): void {
   pendingAttachments.value = pendingAttachments.value.filter((p) => p.key !== key)
 }
 
-// 发送（Enter/按钮/斜杠统一入口，#1）：buildAttachments 校验预览条 → 有拒发则提示「文件过大/类型不
-// 支持」不发；全放行（或无附件走纯文本）则 conn.send 透传。仅真发出才清空预览条（#2：conn.send 守卫
-// 早退——无会话/断线/流式——返回 false，附件不丢）。
+// base64（纯）→ Blob（上传面：RawAttachment content 重建字节，文件名/mime 为权威元数据）
+function base64ToBlob(content: string, mime: string): Blob {
+  const bin = atob(content)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return new Blob([bytes], { type: mime })
+}
+
+// 发送（Enter/按钮/斜杠统一入口，#1）：buildAttachments 校验预览条 → 有拒发则提示不发；
+// 全放行 → 逐个上传换 attachmentId（失败中止保留预览条）→ conn.send（幂等/门控/断线排队）。
+// 仅真受理才清空预览条（conn.send 守卫早退——无会话/在飞/审批挂起——返回 false，附件不丢）。
 async function sendMessage(): Promise<void> {
+  if (uploading) return
   const { attachments, rejected } = buildAttachments(pendingAttachments.value.map((p) => p.att))
   if (rejected.length > 0) {
     const oversize = rejected.some((r) => r.reason === 'size')
     ElMessage.error(oversize ? '文件过大，无法发送' : '存在不支持的附件类型')
     return
   }
-  const sent = conn.send(streaming.value, attachments)
-  if (sent) pendingAttachments.value = [] // 真发出 → 预览条清空；早退保留
+  let refs: SentAttachment[] | undefined
+  if (attachments.length) {
+    if (!chat.selectedSession || conn.disconnected.value) {
+      ElMessage.error(conn.disconnected.value ? '连接已断开，暂不能发送附件' : '请先选择会话')
+      return
+    }
+    uploading = true
+    try {
+      refs = []
+      for (const att of attachments) {
+        const content = typeof att.content === 'string' ? att.content : ''
+        const mime = att.mimeType ?? 'application/octet-stream'
+        const meta = await uploadSessionAttachment(
+          chat.selectedSession,
+          base64ToBlob(content, mime),
+          att.fileName ?? 'file',
+          mime,
+        )
+        refs.push({ attachmentId: meta.attachmentId, mime: meta.mimeType, size: meta.size, fileName: meta.fileName })
+      }
+    } catch (e) {
+      ElMessage.error(e instanceof Error ? e.message : '附件上传失败')
+      return // 预览条保留，可重试
+    } finally {
+      uploading = false
+    }
+  }
+  const accepted = conn.send(refs)
+  if (accepted) pendingAttachments.value = [] // 真受理 → 预览条清空；早退保留
 }
 
 async function regenerate(text: string): Promise<void> {
-  if (!text || streaming.value || conn.disconnected.value) return
+  if (!text || running.value || conn.disconnected.value) return
   chat.setInput(text)
   await nextTick()
   await sendMessage()
 }
 
-// #694 回退的草稿指纹（#693 spec §1.4）：文本 + 附件内容的水位线快照——composable 在 rewind RPC
-// 前后各取一次、比对是否变化（变化即跳过回填，保留用户新草稿）。附件是宿主局部态（不在 store），
-// 故指纹只能算在宿主侧；内容整体入指纹（不做长度摘要），保证「同长不同内容」也判为改动。
-function draftFingerprint(): string {
-  return JSON.stringify([
-    chat.input,
-    pendingAttachments.value.map((p) => [p.att.mimeType ?? '', p.att.fileName ?? '', p.att.content ?? '']),
-  ])
-}
-
-// #694 回退回填（指纹未变时才被 composable 调用；#697 fork 播种共用，改名 applyEntryBackfill——
-// 两路回填语义同构，不维护两份近似实现）：被剪/被点首条用户消息文本覆盖式写入草稿 + 网关返回的
-// 图片附件并入预览条（按内容去重——本地预览条已有同图时不重复插入，官方 merge 同款意图）。
-function applyEntryBackfill(text: string, attachments: RawAttachment[]): void {
-  chat.setInput(text)
-  for (const att of attachments) {
-    if (pendingAttachments.value.some((p) => p.att.mimeType === att.mimeType && p.att.content === att.content)) continue
-    pushAttachment(att)
-  }
-}
-
-async function loadInstances() {
-  try {
-    chat.setInstances(await listInstances())
-    // B0: 总是走 selectContainer——同名且连接活着（gateway 非空）时其内部 early-return 跳过。
-    // 生命周期对齐 KeepAlive（App.vue）：登录态下 ChatView 被缓存，切页走 activated/deactivated、
-    // 连接保持，不 unmount；仅登出时才剔除缓存并 unmount → dispose 断网关。故「store 残留
-    // selectedContainer 而 gateway 已死」只在登出后再登录的 remount 出现，此时必须重建连接，
-    // 否则连接死而 UI 看似活着（send/resolveApproval 静默 no-op）。
-    if (chat.instances.length) {
-      // #702：首次自动选中同样过惰性升级门（打开即需升级的容器不应先建连再被停机打断）
-      await openContainer(chat.selectedContainer || chat.instances[0].name)
-    }
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) return
-    errorMsg.value = (e as Error).message
-  }
-}
-
-onMounted(loadInstances)
+onMounted(() => {
+  void conn.boot()
+})
 onBeforeUnmount(() => {
-  upgrade.dispose() // #702：卸载清升级轮询定时器（过 3s 仍会 tick → 对已卸载组件 setState）
   conn.dispose()
 })
 
 defineExpose({
-  // #702：暴露的仍是「打开容器」语义，但统一过惰性升级门（测试/父组件不再有绕过升级的旁路）
-  selectContainer: openContainer,
-  retryUpgrade: upgrade.retry,
   // #9：暴露的发送统一走 sendMessage（含附件校验/清空预览条），与按钮/Enter 同路径，不分叉。
   send: () => sendMessage(),
   newSession: conn.newSession,
+  selectSession: conn.selectSession,
 })
 </script>
 
@@ -452,16 +378,13 @@ defineExpose({
       @drag-end="onSidebarDragEnd"
     >
       <ChatSidebar
-        :instances="chat.instances"
         :sessions="chat.sessions"
-        :selected-container="chat.selectedContainer"
         :selected-session="chat.selectedSession"
         :sidebar-tab="sidebarTab"
         :tree="fileTabs.tree"
         :tree-error="fileTabs.treeError"
         :active-file-path="fileTabs.activePath ?? ''"
-        @select-container="openContainer"
-        @select-session="conn.pickSession"
+        @select-session="conn.selectSession"
         @remove-session="removeSession"
         @new-session="conn.newSession"
         @switch-tab="switchSidebarTab"
@@ -471,44 +394,30 @@ defineExpose({
     <main class="main">
       <ChatHeader
         :title="currentSessionTitle"
-        :container="chat.selectedContainer"
         :connecting="connecting"
-        :branches="chat.branches"
-        :branch-busy="branchMenuBusy"
-        @branch-switch="branchSwitch"
+        :renameable="!!chat.selectedSession"
+        @rename="renameSession"
       />
-      <div v-if="connectionState" class="connection-banner" :class="connectionState.tone" role="status" aria-live="polite" :data-test="conn.disconnected.value ? 'reconnect-bar' : 'connection-banner'">
+      <div v-if="connectionState" class="connection-banner" :class="connectionState.tone" role="status" aria-live="polite" :data-test="connectionState.test">
         <span class="connection-label">{{ connectionState.label }}</span>
         <span v-if="connectionState.detail" class="connection-detail" data-test="error-bar">{{ connectionState.detail }}</span>
-        <button v-if="conn.disconnected.value" class="reconnect" data-test="reconnect" @click="conn.connect()">重新连接</button>
+        <button v-if="conn.disconnected.value" class="reconnect" data-test="reconnect" @click="conn.reconnect()">重新连接</button>
       </div>
-      <!-- #702 惰性升级横幅：升级在飞期间不建网关连接，故与连接横幅天然互斥 -->
-      <div v-if="upgrade.phase.value === 'upgrading'" class="connection-banner info" role="status" aria-live="polite" data-test="upgrade-banner">
-        <span class="connection-label">{{ UPGRADE_BANNER_TEXT }}</span>
-        <span class="connection-detail">正在升级容器 {{ upgrade.container.value }}，完成后将自动恢复对话</span>
+      <!-- story 10 错误分类红显：run.failed 的三分类横幅（进行态装饰——随新 run/切会话剥落） -->
+      <div v-if="conn.lastRunError.value" class="connection-banner danger run-error" role="alert" data-test="run-error">
+        <span class="connection-label">运行失败（{{ conn.lastRunError.value.kind }}）</span>
+        <span class="connection-detail">{{ conn.lastRunError.value.label }}</span>
       </div>
-      <!-- #701 终态：只透出（删重建丢数据 + 备份可手工救回），不给重试入口——仅可删除重建 -->
-      <div v-else-if="upgrade.phase.value === 'failed'" class="upgrade-notice failed" role="alert" data-test="upgrade-failed">
-        <p class="upgrade-title" data-test="upgrade-failed-title">{{ UPGRADE_FAILED_TITLE }}</p>
-        <p class="upgrade-detail" data-test="upgrade-failed-detail">{{ UPGRADE_FAILED_DETAIL }}</p>
+      <div v-if="executionStatus" class="execution-status" role="status" aria-live="polite" data-test="execution-status">
+        <span>{{ executionStatus }}</span>
+        <button v-if="running" type="button" class="abort" data-test="abort" @click="conn.abort()">中断</button>
       </div>
-      <!-- 触发/轮询异常或升级未完成：如实透出 + 手动重试入口（不卡死、不自动重触发） -->
-      <div v-else-if="upgrade.phase.value === 'error'" class="upgrade-notice error" role="alert" data-test="upgrade-error">
-        <span class="upgrade-detail" data-test="upgrade-error-detail">{{ upgrade.detail.value }}</span>
-        <button class="reconnect" data-test="upgrade-retry" @click="upgrade.retry()">重试升级</button>
-      </div>
-      <div v-if="executionStatus" class="execution-status" role="status" aria-live="polite" data-test="execution-status">{{ executionStatus }}</div>
       <ChatStream
         :messages="chat.messages"
-        :history-has-more="chat.historyHasMore"
-        :history-loading="chat.historyLoading"
-        :rewind-available="rewindAvailable"
-        :fork-available="forkAvailable"
-        @load-more="conn.loadMoreHistory"
+        :history-has-more="false"
+        :history-loading="false"
         @regenerate="regenerate"
         @toggle-trace-fold="chat.toggleTraceFold"
-        @rewind="rewind"
-        @fork="fork"
       >
         <!-- #461：无选中会话（含删除当前会话后）→ 空态视图 + 「新建会话」入口 -->
         <template #empty>
@@ -537,10 +446,8 @@ defineExpose({
         :slash-open="slashOpen"
         :slash-index="chat.slashIndex"
         :connecting="connecting"
-        :streaming="streaming"
+        :streaming="running"
         :disconnected="conn.disconnected.value"
-        :rewind-busy="conn.rewindBusy.value"
-        :fork-busy="conn.forkBusy.value"
         :pending-attachments="pendingAttachments"
         @input="conn.onComposerInput"
         @keydown="conn.onComposerKeydown"
@@ -549,7 +456,7 @@ defineExpose({
         @add-files="addFiles"
         @remove-attachment="removeAttachment"
       >
-        <!-- T07 斜杠补全菜单表现（父注入，逻辑留宿主 useChatConnection） -->
+        <!-- T07 斜杠补全菜单表现（父注入，逻辑留宿主 useChatSession） -->
         <template #slash-menu="{ matches, slashIndex }">
           <div v-if="matches.length" class="slash-menu" data-test="slash-menu">
             <div
@@ -608,14 +515,9 @@ defineExpose({
 .connection-label { font-weight: 600; }
 .connection-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .connection-banner .reconnect { margin-left: auto; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 2px 10px; cursor: pointer; color: inherit; font-size: 12.5px; }
-.execution-status { padding: 5px 18px; border-bottom: 1px solid var(--el-border-color-lighter); color: var(--el-text-color-secondary); font-size: 12px; }
-
-/* #702 惰性升级：终态/异常提示条（与连接横幅同族排版，色调区分语义） */
-.upgrade-notice { display: flex; align-items: center; gap: 10px; padding: 8px 18px; font-size: 13px; }
-.upgrade-notice.failed { color: var(--el-color-danger); background: var(--el-color-danger-light-9); flex-direction: column; align-items: flex-start; gap: 4px; }
-.upgrade-notice.error { color: var(--el-color-warning); background: var(--el-color-warning-light-9); }
-.upgrade-notice .upgrade-title { margin: 0; font-weight: 600; }
-.upgrade-notice .upgrade-detail { margin: 0; color: inherit; }
+.execution-status { display: flex; align-items: center; gap: 10px; padding: 5px 18px; border-bottom: 1px solid var(--el-border-color-lighter); color: var(--el-text-color-secondary); font-size: 12px; }
+.execution-status .abort { margin-left: auto; background: transparent; border: 1px solid var(--el-color-danger); color: var(--el-color-danger); border-radius: 6px; padding: 2px 10px; cursor: pointer; font-size: 12px; }
+.execution-status .abort:hover { background: var(--el-color-danger-light-9); }
 
 /* T07 斜杠补全菜单（spec §9.4 / 原型 oc-chat-page.html）：弹在输入框上方，cmd mono + 描述 */
 .slash-menu { position: absolute; bottom: calc(100% + 6px); left: 18px; right: 18px; max-height: 280px; overflow-y: auto; background: var(--el-bg-color-overlay); border: 1px solid var(--el-border-color); border-radius: 11px; box-shadow: 0 -8px 30px rgba(0, 0, 0, .18); z-index: 10; }

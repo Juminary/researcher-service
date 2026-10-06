@@ -6,12 +6,14 @@
 // hover 摘要最大长度（前几十字）；超长截断加省略号。
 export const SUMMARY_MAX_CHARS = 40
 
-// 纯媒体消息（无文本）的类型占位——与 MediaBlock.type 对齐（document 即文件附件）。
-export const MEDIA_PLACEHOLDERS: Record<string, string> = {
-  image: '[图片]',
-  video: '[视频]',
-  audio: '[音频]',
-  document: '[文件]',
+// 纯媒体消息（无文本）的占位——#780 D9 MediaRef 引用面无 type 字段，按 mime 前缀派生
+// （image/video/audio 前缀；其余含 document 视作文件附件）。
+export function mediaPlaceholder(m: { mime?: string }): string {
+  const mime = m.mime ?? ''
+  if (mime.startsWith('image/')) return '[图片]'
+  if (mime.startsWith('video/')) return '[视频]'
+  if (mime.startsWith('audio/')) return '[音频]'
+  return '[文件]'
 }
 
 // 锚点筛选：仅 role=user 消息进轨（assistant 与审批卡不进轨，#667 实现决策），
@@ -26,11 +28,11 @@ export function selectUserAnchorIndices(messages: { role: string }[]): number[] 
 
 // hover 摘要：文本前 SUMMARY_MAX_CHARS 字（超长加省略号）；纯媒体消息（无文本）取第一个
 // 附件类型占位；文本+媒体混合以文本优先（仅纯媒体才占位）；换行折叠为空格（tooltip 单行）。
-export function anchorSummary(msg: { text: string; media: { type: string }[] }): string {
+export function anchorSummary(msg: { text: string; media: { mime?: string }[] }): string {
   const text = msg.text.replace(/\s+/g, ' ').trim()
   if (!text) {
     const first = msg.media[0]
-    return first ? (MEDIA_PLACEHOLDERS[first.type] ?? '[文件]') : ''
+    return first ? mediaPlaceholder(first) : ''
   }
   return text.length > SUMMARY_MAX_CHARS ? text.slice(0, SUMMARY_MAX_CHARS) + '…' : text
 }

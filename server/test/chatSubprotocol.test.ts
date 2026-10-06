@@ -1,12 +1,12 @@
 // #337 M5 隧道：Sec-WebSocket-Protocol 两格式解析 + subprotocol 回显选择（对齐 Django
 // accounts/middleware.py._extract_token + _choose_subprotocol 语义，测试接缝 3 WS 桥）。
 // 纯函数无 I/O：直接单测，不经 HTTP。
+// #793：跨语言契约单一来源 cross-test（读 frontend/src/chat/protocol.ts pin 两端一致）随前端
+// 协议机死区退役——前端 @openclaw/gateway-client 已删，wire 契约再无前端对端可 pin；server 侧
+// subprotocol 纯函数保留至 T0 #801 隧道整体退役。注释性对端见 test/pairingSmoke.test.ts 头注。
 
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 import { parseProtocolToken, chooseProtocol } from '../src/chat/subprotocol'
-import { WS_CHAT_PROTOCOL } from '../src/chat/values'
 
 describe('parseProtocolToken（两格式 wire）', () => {
   it('格式① [' + "'access_token', <jwt>]" + ' → 取第 2 项', () => {
@@ -62,19 +62,5 @@ describe('chooseProtocol（RFC 6455 原样回显）', () => {
     // 修复后两者基于同一份解析 → chooseProtocol 也 undefined，语义一致。
     expect(parseProtocolToken('other, access_token, eyJ0okEn')).toBeNull()
     expect(chooseProtocol(new Set(['other', 'access_token', 'eyJ0okEn']))).toBeUndefined()
-  })
-})
-
-describe('access_token wire 契约单一来源（#14）', () => {
-  // 契约字面量硬编码在运行时（server Node values / frontend TS protocol），无单一文件。改传输
-  // 格式（前缀改名/加版本）须两端同步，否则 WS 握手静默 1006/4401。
-  // 放 server（Node 环境）读源码文本 pin 两处一致——不引入 frontend 无 Node 类型的环境负担。
-  // （#341 M9：Django backend 退役，Python middleware 一侧从契约对消失。）
-  // vitest 从 server/ 运行 → cwd=server，上级即仓库根。
-  const ROOT = path.resolve(process.cwd(), '..')
-
-  it('frontend/src/chat/protocol.ts 的 WS_CHAT_PROTOCOL 与 server values 一致', () => {
-    const ts = readFileSync(path.join(ROOT, 'frontend/src/chat/protocol.ts'), 'utf8')
-    expect(ts).toContain(`WS_CHAT_PROTOCOL = '${WS_CHAT_PROTOCOL}'`)
   })
 })

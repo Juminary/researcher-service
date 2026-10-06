@@ -6,7 +6,6 @@
 import { describe, expect, it } from 'vitest'
 import {
   SUMMARY_MAX_CHARS,
-  MEDIA_PLACEHOLDERS,
   activeAnchorIndex,
   anchorRatios,
   anchorSummary,
@@ -50,21 +49,21 @@ describe('anchorSummary（hover 摘要：文本截断 / 媒体占位）', () => 
   })
 
   it('纯图片消息 → [图片] 占位', () => {
-    expect(anchorSummary({ text: '', media: [{ type: 'image' }] })).toBe(MEDIA_PLACEHOLDERS.image)
+    expect(anchorSummary({ text: '', media: [{ mime: 'image/png' }] })).toBe('[图片]')
   })
 
   it('纯视频/音频/文件消息 → 对应类型占位', () => {
-    expect(anchorSummary({ text: '', media: [{ type: 'video' }] })).toBe('[视频]')
-    expect(anchorSummary({ text: '', media: [{ type: 'audio' }] })).toBe('[音频]')
-    expect(anchorSummary({ text: '', media: [{ type: 'document' }] })).toBe('[文件]')
+    expect(anchorSummary({ text: '', media: [{ mime: 'video/mp4' }] })).toBe('[视频]')
+    expect(anchorSummary({ text: '', media: [{ mime: 'audio/mpeg' }] })).toBe('[音频]')
+    expect(anchorSummary({ text: '', media: [{ mime: 'application/pdf' }] })).toBe('[文件]')
   })
 
   it('文本+媒体混合 → 文本摘要优先（仅纯媒体才占位）', () => {
-    expect(anchorSummary({ text: '看这张图', media: [{ type: 'image' }] })).toBe('看这张图')
+    expect(anchorSummary({ text: '看这张图', media: [{ mime: 'image/png' }] })).toBe('看这张图')
   })
 
   it('多附件纯媒体 → 取第一个附件类型占位', () => {
-    expect(anchorSummary({ text: '', media: [{ type: 'video' }, { type: 'image' }] })).toBe('[视频]')
+    expect(anchorSummary({ text: '', media: [{ mime: 'video/mp4' }, { mime: 'image/png' }] })).toBe('[视频]')
   })
 
   it('文本含换行 → 折叠为空格（tooltip 单行）', () => {

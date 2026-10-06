@@ -194,12 +194,11 @@ onBeforeUnmount(() => {
   if (flashTimer) clearTimeout(flashTimer)
 })
 
-// DOM 更新后（新消息/历史加载更多 prepend）跟随。onUpdated 只对「本组件 render effect
-// 失效」触发——流式 delta 是 useChatConnection 对消息对象**原地 mutation**（last.raw/text 就地改，
-// 数组与对象身份不变），本组件渲染不读 text/thinking，render effect 不失效，onUpdated 不触发，
-// 流式逐字追加会漏滚（#400 验收①第三场景，code-review 实证）。故补 layoutWatch：投影快照
-// 只追踪「渲染布局相关字段」（role/streaming/raw 决定气泡高度），detailOpen/tools 等不属布局
-// 变化、天然不进快照——不因 deep watch 被破坏。watch 回调统一走 scrollToBottom（rAF 节流）。
+// DOM 更新后（新消息到达）跟随。onUpdated 只对「本组件 render effect 失效」触发——流式 delta
+// 经归约器 copy-on-write 产生**新数组引用**，props.messages 替换会失效 render effect，但渲染
+// 不读 text/thinking（气泡高度字段），故补 layoutWatch：快照只追踪「渲染布局相关字段」
+// （role/streaming/raw 决定气泡高度），detailOpen/tools 等不属布局变化、天然不进快照。
+// watch 回调统一走 scrollToBottom（rAF 节流）。
 watch(
   () => props.messages.map((m) => `${m.role}|${m.streaming}|${m.raw.length}`).join('|'),
   onTimelineContentChanged,

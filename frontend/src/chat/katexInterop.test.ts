@@ -6,6 +6,7 @@
 // （ChatView 构建产物 13:28645 / 277:39494），对话页白屏。
 // 修复：源码显式解包 CJS default，使两种互操作语义下插件都是函数。
 import { describe, expect, it, vi } from 'vitest'
+/// <reference types="node" />
 import { createRequire } from 'node:module'
 import MarkdownIt from 'markdown-it'
 import type { MarkdownIt as MarkdownItType } from 'markdown-it'

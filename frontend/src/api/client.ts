@@ -23,7 +23,8 @@ const ENVELOPE_UNAUTHENTICATED_CODES: ReadonlySet<number> = new Set([10001, 1000
 function buildHeaders(init: RequestInit, token: string): Headers {
   const headers = new Headers(init.headers)
   if (token) headers.set('Authorization', `Bearer ${token}`)
-  if (init.body != null && !headers.has('Content-Type')) {
+  // FormData（multipart，如附件上传）不设 Content-Type——浏览器须自带 multipart boundary。
+  if (init.body != null && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   return headers

@@ -15,6 +15,11 @@ export function runIncrementalSchema(db) {
   if (hasSessions && !db.prepare('PRAGMA table_info("sessions")').all().some(c => c.name === 'preferredModelJson')) {
     db.exec('ALTER TABLE "sessions" ADD COLUMN "preferredModelJson" TEXT')
   }
+  // #782（#747·12）：sessions 水位列（files rewind 的 planRevert 判定下界——scope=chat 保持
+  // 现状永久化面）。ADD COLUMN 非幂等，PRAGMA guard 先查再补（对齐 preferredModelJson 模式）。
+  if (hasSessions && !db.prepare('PRAGMA table_info("sessions")').all().some(c => c.name === 'fileJournalAnchorSeq')) {
+    db.exec('ALTER TABLE "sessions" ADD COLUMN "fileJournalAnchorSeq" INTEGER')
+  }
   db.exec(`
 CREATE TABLE IF NOT EXISTS "text_trace_logs" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -150,6 +155,7 @@ CREATE TABLE IF NOT EXISTS "sessions" (
     "forkSourceJson" TEXT,
     "activeCheckpointId" TEXT,
     "preferredModelJson" TEXT,
+    "fileJournalAnchorSeq" INTEGER,
     "archivedAt" DATETIME,
     "isTeammate" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -296,9 +302,37 @@ CREATE TABLE IF NOT EXISTS "file_journal" (
     "afterSha256" TEXT,
     "tombstoneKey" TEXT,
     "toolCallId" TEXT NOT NULL,
+    "runId" TEXT,
     "applied" BOOLEAN NOT NULL DEFAULT false,
+    "fileRevertedAt" DATETIME,
+    "archivedAt" DATETIME,
     CONSTRAINT "file_journal_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "sessions" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
+`)
+
+  // #782（#747·12）：file_journal 生命周期三列（runId = 终态回填键；fileRevertedAt = 逆放
+  // 处置标；archivedAt = 被放弃路线软删）。镜像部署早于本票的库已建出无列表——CREATE IF NOT
+  // EXISTS 对既有表 no-op，PRAGMA guard 先查再补（对齐 T02/T03 模式）。fresh 库（上方
+  // CREATE TABLE 已带列）→ guard 跳过。**guard 必须先于下方索引创建**（#778 clientKey 同型
+  // 坑，#818 CD 崩溃回归生产实锤）。
+  const hasFileJournal = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='file_journal'").get()
+  if (hasFileJournal) {
+    const fjCols = db.prepare('PRAGMA table_info("file_journal")').all()
+    if (!fjCols.some((c) => c.name === 'runId')) {
+      db.exec('ALTER TABLE "file_journal" ADD COLUMN "runId" TEXT')
+    }
+    if (!fjCols.some((c) => c.name === 'fileRevertedAt')) {
+      db.exec('ALTER TABLE "file_journal" ADD COLUMN "fileRevertedAt" DATETIME')
+    }
+    if (!fjCols.some((c) => c.name === 'archivedAt')) {
+      db.exec('ALTER TABLE "file_journal" ADD COLUMN "archivedAt" DATETIME')
+    }
+  }
+
+  db.exec(`
+CREATE INDEX IF NOT EXISTS "file_journal_sessionId_checkpointId_idx" ON "file_journal"("sessionId", "checkpointId");
+CREATE UNIQUE INDEX IF NOT EXISTS "file_journal_sessionId_seq_key" ON "file_journal"("sessionId", "seq");
+CREATE UNIQUE INDEX IF NOT EXISTS "file_journal_sessionId_toolCallId_key" ON "file_journal"("sessionId", "toolCallId");
 `)
 
   // #786 teammate thread flags: existing session rows default to leader; teammate threads are hidden

@@ -134,6 +134,7 @@ CREATE TABLE "sessions" (
     "parentSessionKey" TEXT,
     "forkSourceJson" TEXT,
     "activeCheckpointId" TEXT,
+    "fileJournalAnchorSeq" INTEGER,
     "preferredModelJson" TEXT,
     "archivedAt" DATETIME,
     "isTeammate" BOOLEAN NOT NULL DEFAULT false,
@@ -338,7 +339,9 @@ CREATE TABLE "file_journal" (
     "afterSha256" TEXT,
     "tombstoneKey" TEXT,
     "toolCallId" TEXT NOT NULL,
+    "runId" TEXT,
     "applied" BOOLEAN NOT NULL DEFAULT false,
+    "fileRevertedAt" DATETIME,
     "archivedAt" DATETIME,
     CONSTRAINT "file_journal_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "sessions" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );

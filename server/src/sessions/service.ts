@@ -28,16 +28,15 @@ import { getSessionForUser } from '../sandboxes/service'
 import type { SandboxRemoveOutcome } from '../sandboxes/lifecycle'
 import type { EventPublisher, InFlightProjection, RunCommand, RunSnapshot } from '../runner/runtime/runService'
 import { serializeAttachments, type RecordTurnPayload } from './reducer'
-import { ancestorChainOf } from '../checkpointChain'
+import { ancestorChainOf, loadCheckpointParentOf, visibleRowIds, type HistoryRowLite } from '../checkpointChain'
 import {
   abandonedCheckpointIds,
   resolveRewindAnchor,
-  visibleRowIds,
-  type HistoryRowLite,
 } from './rewind'
-import { TITLE_AUTO_MAX, TITLE_MAX } from './values'
+import { TITLE_AUTO_MAX, TITLE_MAX, type RewindScope } from './values'
 import type { TeammateStatus } from '../runner/teammates/service'
 import type { ApprovalInterruptPayload } from '../runner/approval/funnel'
+import type { RewindPreview as FileRewindPreview } from '../runner/filejournal/preview'
 
 // 会话摘要（session.created/updated 载荷 + 列表行 + 创建/PATCH 返回——同一形状）。
 export interface SessionSummary {
@@ -120,9 +119,12 @@ export interface SessionRunGateway {
   }) => RunCommand
   /** in-flight 投影（#779 story 11）：重拉投影的补偿重建面（running 从 checkpoint 重建/queued 空 turn） */
   readonly inFlightProjection: (sessionId: string) => Promise<InFlightProjection | undefined>
-  /** rewind 跨派生点的 teammate 级联作废（#786 AC4）：锚点祖先链判定 + 归档 + 未读留言失效
-   *  + 停跑/事件，由 RunService 统一面完成；缺省不注 = 无 teammate 语义（旧 fake 兼容）。 */
+  /** teammate 级联作废（#781 缺口顺带接线；#786 AC4 演进：锚点祖先链判定 + 归档 + 未读留言
+   *  失效 + 停跑/事件，由 RunService 统一面完成） */
   readonly teammatesForRewind?: (sessionId: string, checkpointId: string) => Promise<void>
+  /** C1 通知面（#782 拆面：作废归 teammatesForRewind、逆放前先行；本方法在 rewindFiles 后调——
+   *  degradedFiles 分文案，/lab 未动时如实报「回退未完成」） */
+  readonly teammatesNotifyFileRewind?: (sessionId: string, checkpointId: string, degradedFiles: boolean) => Promise<void>
 }
 
 // run 命令发射口（submit 入队 ack 语义）：生产 = BullMQ submit（resolve = job 已入队；
@@ -152,9 +154,44 @@ export interface SessionServiceDeps {
       attachmentIds: readonly string[],
     ) => Promise<void>
   }
+  /** 文件 rewind（#782 · D8）：rewindFiles 逆放 + 预览。缺省不注 = 文件面 no-op（测试可控）。 */
+  readonly fileRewind?: {
+    readonly rewindFiles: (p: {
+      sessionId: string
+      anchor: string
+      userId: string
+      username: string
+    }) => Promise<{ reverted: number; skippedMissing: number; degraded: boolean }>
+    /** 锁内直呼面（rewindSession 持 runRewindExclusive 同一围栏——外层 rewindFiles 重入即
+     *  死锁；与 runRewindExclusive 成对注入，缺后者时 rewindSession 走无锁 rewindFiles） */
+    readonly rewindFilesCore: (p: {
+      sessionId: string
+      anchor: string
+      userId: string
+      username: string
+    }) => Promise<{ reverted: number; skippedMissing: number; degraded: boolean }>
+    /** rewind 会话级互斥（「锚点校验→归档事务→逆放」整段 FIFO 串行化——双端并发 rewind 面） */
+    readonly runRewindExclusive?: <T>(sessionId: string, fn: () => Promise<T>) => Promise<T>
+    readonly preview: (p: {
+      sessionId: string
+      anchor: string
+      caller?: { userId: string; username: string }
+    }) => Promise<FileRewindPreview>
+  }
   /** 插件运行时（#788 · #752 §2.3）：插件命令 {inject}/{execute} 在 sendMessage 命令构造点
    *  消费（启用集 per-command 现读快照）。缺省不注 = 无插件命令源（两源合并退化为单源）。 */
   readonly plugins?: PluginRuntime
+}
+
+// 恢复菜单三态 REWIND_SCOPES/RewindScope 单点在 ./values（zod schema 同源派生）。
+
+export interface RewindResult {
+  readonly sessionId: string
+  /** scope=all/chat = 新锚点；scope=files = 指针不变（对话未动） */
+  readonly activeCheckpointId: string | null
+  readonly scope: RewindScope
+  /** 文件面结果（scope=chat 缺省——未执行逆放） */
+  readonly files?: { readonly reverted: number; readonly skippedMissing: number; readonly degraded: boolean }
 }
 
 // RunService recordTurn 注入缝的载荷（RecordTurnPayload）单一声明于 './reducer'。
@@ -613,64 +650,184 @@ export class SessionService {
     this.publishSessionEvent(session.ownerId, 'session.updated', { session: summary(fresh) }, sessionId)
   }
 
-  // ---- rewind（story 16 · #770 三操作模型）：换 activeCheckpointId 指针重开 + 被放弃路线
-  // 软删存档（checkpoint/journal/消息行 archivedAt——行不物理删，产品面不可读无恢复入口，
-  // 「比较路线」= fork 并存多开）。锚点以消息行表达（产品面选历史消息），解析 + 挂靠判定在
-  // 纯逻辑（./rewind）。完成后 session.invalidated{reason:rewind} 广播（多端重拉投影）。
-  // 文件 /lab 的 journal 逆放恢复归 #782（本票纯对话指针）。----
+  // ---- rewind（story 16 · #770 三操作模型 + #782 三态）：换 activeCheckpointId 指针重开 +
+  // 被放弃路线软删存档（checkpoint/journal/消息行 archivedAt——行不物理删，产品面不可读无恢复
+  // 入口，「比较路线」= fork 并存多开）。锚点以消息行表达（产品面选历史消息），解析 + 挂靠判定
+  // 在纯逻辑（./rewind）。完成后 session.invalidated{reason:rewind} 广播（多端重拉投影）。
+  //
+  // 三态（#747 UX · scope）：all（缺省）= 对话面 + 文件逆放（file_journal 全局序逆放恢复 /lab
+  // 至锚点时刻，含 anchor 后用户上传一并回退；exec 显式降级不入账）；chat = 只回对话（文件保持
+  // 现状永久化——水位推进至当前 max(seq)，行不再拾起）；files = 只回文件（journal 归档 + 逆放，
+  // 对话面零改动、指针不动）。teammate 面：跨派生点作废（#781 缺口顺带接线）+ 存活者信箱通知
+  //（scope≠chat——C1）。----
   async rewindSession(
     user: Pick<AuthUser, 'id' | 'role'>,
     sessionId: string,
-    p: { messageId: string },
-  ): Promise<{ sessionId: string; activeCheckpointId: string }> {
+    p: { messageId: string; scope?: RewindScope },
+  ): Promise<RewindResult> {
+    const scope: RewindScope = p.scope ?? 'all'
     const session = await getSessionForUser(this.deps.prisma, user, sessionId)
     this.requireTerminal(sessionId)
 
-    const rows = await this.listHistoryRows(sessionId)
-    const anchor = resolveRewindAnchor(rows, p.messageId)
+    // 会话级互斥（双端并发 rewind 面）：「锚点校验→归档事务→逆放」整段 FIFO 串行化——两端
+    // 各持视图交错会写悬空指针（锚已被先行 rewind 归档仍被写为 activeCheckpointId）+ chain
+    // 截断过度逆放。锁内重跑 anchorForRewind：被先行 rewind 归档的锚点同拒 90002。
+    // fileRewind 未注 runRewindExclusive（旧装配面）= 无锁直跑（单端语义不变）。
+    const run = async (): Promise<RewindResult> => {
+      // 锁内重验 run 终态（排队等锁期间新 run 可插入——sendMessage 门禁放行、checkpoint 随
+      // 执行落账；获锁后归档其中间 checkpoint = 误撤在飞 run 面）。锁外首验为便宜拒绝。
+      this.requireTerminal(sessionId)
+      const rows = await this.listHistoryRows(sessionId)
+      const { anchor, parentOf } = await this.anchorForRewind(sessionId, rows, p.messageId)
+      const anchorChain = ancestorChainOf((id) => parentOf.get(id) ?? null, anchor)
+
+      // 被放弃 checkpoint（未归档全体 − 锚点链）——共享前缀（锚点之前）一律不打标记。
+      const abandoned = abandonedCheckpointIds([...parentOf.keys()], anchorChain)
+      const now = new Date()
+
+      if (scope === 'files') {
+        // 只回文件：journal 行归档（投影/继承面）+ 逆放；checkpoint/消息行与指针零改动
+        if (abandoned.size > 0) {
+          await this.deps.prisma.fileJournal.updateMany({
+            where: { sessionId, checkpointId: { in: [...abandoned] } },
+            data: { archivedAt: now },
+          })
+        }
+      } else {
+        const maxSeq = await this.deps.prisma.fileJournal.findFirst({
+          where: { sessionId },
+          orderBy: { seq: 'desc' },
+          select: { seq: true },
+        })
+        const writes: PrismaPromise<unknown>[] = [
+          ...(abandoned.size > 0
+            ? [
+                this.deps.prisma.checkpoint.updateMany({
+                  where: { threadId: sessionId, checkpointId: { in: [...abandoned] } },
+                  data: { archivedAt: now },
+                }),
+                this.deps.prisma.fileJournal.updateMany({
+                  where: { sessionId, checkpointId: { in: [...abandoned] } },
+                  data: { archivedAt: now },
+                }),
+              ]
+            : []),
+          ...this.archiveRowWrites(sessionId, rows, anchorChain, now),
+          this.deps.prisma.session.update({
+            where: { id: sessionId },
+            data: {
+              activeCheckpointId: anchor,
+              // scope=chat：文件保持现状永久化——水位推进至当前 max(seq)（行不逆放不再拾起）
+              ...(scope === 'chat' ? { fileJournalAnchorSeq: maxSeq?.seq ?? 0 } : {}),
+            },
+          }),
+        ]
+        await this.deps.prisma.$transaction(writes)
+      }
+
+      // teammate 作废面 + 文件逆放（对话面事务已提交——事实已发生）：异常终态补偿统一在此
+      // try 内（作废失败 survivor 未停跑继续 running，无补偿则重试撞 50005 收敛卡死）——事件
+      // 与 C1 通知照发（degraded 语义如实）后重抛，REST 错误信封驱动重试，残行由重试/boot
+      // 续放收敛。已持互斥锁时走 rewindFilesCore 直呼（外层 rewindFiles 重入 fence 即死锁）
+      let files: RewindResult['files']
+      const fileRewind = this.deps.fileRewind
+      try {
+        await this.deps.runService.teammatesForRewind?.(sessionId, anchor)
+        if (scope !== 'chat' && fileRewind) {
+          const owner = await this.deps.prisma.user.findUnique({
+            where: { id: session.ownerId },
+            select: { username: true },
+          })
+          const rewindInput = {
+            sessionId,
+            anchor,
+            userId: session.ownerId,
+            username: owner?.username ?? '',
+          }
+          files = await (fileRewind.runRewindExclusive !== undefined
+            ? fileRewind.rewindFilesCore(rewindInput)
+            : fileRewind.rewindFiles(rewindInput))
+        }
+      } catch (err) {
+        this.publishSessionEvent(session.ownerId, 'session.invalidated', { reason: 'rewind' }, sessionId)
+        try {
+          await this.deps.runService.teammatesNotifyFileRewind?.(sessionId, anchor, true)
+        } catch (notifyErr) {
+          // 通知失败不吞原始错误（REST 归因保真）——warn 留痕
+          // eslint-disable-next-line no-console
+          console.warn(`[sessions] rewind 补偿通知失败: session=${sessionId}: ${String(notifyErr)}`)
+        }
+        throw err
+      }
+      // C1 通知面（逆放完成后——文案「已逆放恢复」在事实之后）；degraded（容器缺失/深度
+      // 超限——/lab 未动）如实报「回退未完成」；机制未接线（fileRewind 缺省）= 文件未动，
+      // 同 degraded 语义
+      if (scope !== 'chat') {
+        await this.deps.runService.teammatesNotifyFileRewind?.(sessionId, anchor, files?.degraded ?? true)
+      }
+
+      this.publishSessionEvent(session.ownerId, 'session.invalidated', { reason: 'rewind' }, sessionId)
+      // scope=files 返回指针锁内重读（并发串行化后锁外快照可能已被先行 rewind 归档失效）
+      const currentPointer =
+        scope === 'files'
+          ? (
+              await this.deps.prisma.session.findUniqueOrThrow({
+                where: { id: sessionId },
+                select: { activeCheckpointId: true },
+              })
+            ).activeCheckpointId
+          : null
+      return {
+        sessionId,
+        activeCheckpointId: scope === 'files' ? currentPointer : anchor,
+        scope,
+        ...(files !== undefined ? { files } : {}),
+      }
+    }
+
+    return this.deps.fileRewind?.runRewindExclusive !== undefined
+      ? await this.deps.fileRewind.runRewindExclusive(sessionId, run)
+      : await run()
+  }
+
+  // 锚点解析（rewind/preview 共用——同码同判定）：resolveRewindAnchor + checkpoint 存在性
+  // 兜底（归档 checkpoint 不可作锚点——#770 无恢复入口；「行未归档但 checkpoint 已归档」
+  // 机制性不一致态两入口同拒，preview 判定 ≡ 执行判定）。fork 切点文案不同不复用。
+  private async anchorForRewind(
+    sessionId: string,
+    rows: Parameters<typeof resolveRewindAnchor>[0],
+    messageId: string,
+  ): Promise<{ anchor: string; parentOf: Map<string, string | null> }> {
+    const anchor = resolveRewindAnchor(rows, messageId)
     if (anchor === null) {
       throw fail(CODE.VALIDATION_FAILED, '该消息不可作为回退锚点（无更早的可回退 state）')
     }
-    // 归档 checkpoint 不可作锚点（#770 无恢复入口；归档行已由 listHistoryRows 滤除，此处兜
-    // 「行未归档但 checkpoint 已归档」的机制性不一致）。
     const parentOf = await this.checkpointParentLookup(sessionId)
     if (!parentOf.has(anchor)) {
       throw fail(CODE.VALIDATION_FAILED, '锚点 checkpoint 缺失或已归档')
     }
-    const anchorChain = ancestorChainOf((id) => parentOf.get(id) ?? null, anchor)
+    return { anchor, parentOf }
+  }
 
-    // 软删存档（#770）：被放弃 checkpoint（未归档全体 − 锚点链）+ journal（checkpointId ∈
-    // 被放弃集）+ 挂靠不可见消息行——共享前缀（锚点之前）一律不打标记。
-    const abandoned = abandonedCheckpointIds([...parentOf.keys()], anchorChain)
-    const now = new Date()
-    const writes: PrismaPromise<unknown>[] = [
-      ...(abandoned.size > 0
-        ? [
-            this.deps.prisma.checkpoint.updateMany({
-              where: { threadId: sessionId, checkpointId: { in: [...abandoned] } },
-              data: { archivedAt: now },
-            }),
-            this.deps.prisma.fileJournal.updateMany({
-              where: { sessionId, checkpointId: { in: [...abandoned] } },
-              data: { archivedAt: now },
-            }),
-          ]
-        : []),
-      ...this.archiveRowWrites(sessionId, rows, anchorChain, now),
-      this.deps.prisma.session.update({
-        where: { id: sessionId },
-        data: { activeCheckpointId: anchor },
-      }),
-    ]
-    await this.deps.prisma.$transaction(writes)
-
-    // AC4（#786）：跨派生点的 teammate 级联作废（锚点祖先链不含其 spawnedAtCheckpointId →
-    // 归档 + 未读留言失效 + 停跑/run.aborted{by:system} 事件）。指针换锚事务提交后执行：
-    // 作废判据 = 新锚点链，与落库状态一致；失败向上抛（事务已提交，重试 rewind 同锚点幂等）。
-    await this.deps.runService.teammatesForRewind?.(sessionId, anchor)
-
-    this.publishSessionEvent(session.ownerId, 'session.invalidated', { reason: 'rewind' }, sessionId)
-    return { sessionId, activeCheckpointId: anchor }
+  // rewind 预览（#782 · D8）：逆放集摘要 + exec 跨越清单（复用轨迹聚合，零新增存储）。
+  // 只读不写——产品面确认门（恢复菜单）的输入。
+  async rewindPreview(
+    user: Pick<AuthUser, 'id' | 'role' | 'username'>,
+    sessionId: string,
+    p: { messageId: string },
+  ): Promise<{ anchor: string } & FileRewindPreview> {
+    await getSessionForUser(this.deps.prisma, user, sessionId) // 归属校验（50002 同码防探测）
+    this.requireTerminal(sessionId) // 与执行面同门禁——执行不可达（50005）时预览不预告可行
+    const rows = await this.listHistoryRows(sessionId)
+    const { anchor } = await this.anchorForRewind(sessionId, rows, p.messageId)
+    return this.deps.fileRewind
+      ? await this.deps.fileRewind.preview({
+          sessionId,
+          anchor,
+          caller: { userId: user.id, username: user.username },
+        })
+      : // 机制未接线（fileRewind 缺省）——空预览本地构造（跨域运行时 import 走注入缝纪律）
+        { anchor, revertOps: 0, pathSample: [], pathTotal: 0, execCrossed: [] }
   }
 
   // ---- fork（story 18/20 · #768 D7 修订）：唯一复制原语。新 Session 行（parentSessionKey +
@@ -914,11 +1071,7 @@ export class SessionService {
   // thread 的未归档 checkpointId → parentCheckpointId 查找表（rewind/fork/残留清理共用）：
   // 链行走只在活跃（未归档）图上进行——归档行不参与祖先链（被放弃分叉不复活）。
   private async checkpointParentLookup(sessionId: string): Promise<Map<string, string | null>> {
-    const cps = await this.deps.prisma.checkpoint.findMany({
-      where: { threadId: sessionId, archivedAt: null },
-      select: { checkpointId: true, parentCheckpointId: true },
-    })
-    return new Map(cps.map((c) => [c.checkpointId, c.parentCheckpointId]))
+    return loadCheckpointParentOf(this.deps.prisma, sessionId)
   }
 
   // 活跃行里最新带锚 assistant 锚点（fork 缺省切点解析面；无 → null）

@@ -7,17 +7,18 @@
 import type { PrismaClient } from '../generated/prisma/client'
 import type { StreamHub } from '../events/hub'
 import type { RunServiceDeps } from './runtime/runService'
+import { DockerPrimitives } from './backend/dockerPrimitives'
 import { PrismaCheckpointSaver } from './persistence/prismaCheckpointSaver'
 import { ProviderRegistry } from './providerRegistry'
 import { ConcurrencyGate } from './concurrency'
-import { DockerPrimitives } from './backend/dockerPrimitives'
 import { RunService } from './runtime/runService'
 import { BullMqRunQueue } from './bullmqRunQueue'
 import { disableLangsmithTracing } from './runtime/tracing'
 import { installAbortRejectionGuard } from './runtime/abortGuard'
 import { config } from '../config'
+import { loadCheckpointParentOf } from '../checkpointChain'
 import { wikiContainerName } from '../wikiContainers/runtime'
-import { SANDBOX_CONTAINER_PREFIX } from '../sandboxes/values'
+import { sandboxContainerName } from '../sandboxes/runtime'
 import { createDownloadNode } from './runtime/downloadNode'
 import { createPrismaApprovalAuditSink } from './approval/audit'
 import { ToolCallJudgeClient } from './approval/judge'
@@ -26,6 +27,7 @@ import { JUDGE_POLICY_MARKDOWN } from './approval/values'
 import { WriteLockRegistry } from './writelock/registry'
 import { withLockedPuts } from './writelock/lockedBackend'
 import { TeammateService } from './teammates/service'
+import { FileJournalService } from './filejournal/service'
 import { TEAMMATE_TOOL_NAMES } from './teammates/tools'
 import { FILE_TOOLS, EXEC_TOOLS } from './approval/values'
 import { PLUGIN_MANIFESTS } from '../../../plugins/index'
@@ -40,6 +42,8 @@ export interface RunnerAssembly {
   /** #790 通道③独立 run 的装配复用面（WikiUpdateRunService 共享同一 registry/primitives） */
   readonly registry: ProviderRegistry
   readonly primitives: DockerPrimitives
+  /** 文件 rewind 机制（#782）：SessionService fileRewind 面与启动 reconcile 的共用单例 */
+  readonly fileJournal: FileJournalService
   /** 插件运行时（#788）：SessionService 命令构造点消费（{inject}/{execute} outcome 面） */
   readonly plugins: PluginRuntime
   close: () => Promise<void>
@@ -59,6 +63,8 @@ export async function assembleRunner(opts: {
   judge?: NonNullable<ApprovalFunnelDeps['judge']>
   /** #780 附件 ingestion（片 2：run 首步物化到沙箱 + 图片内联；server.ts 注入 AttachmentsService） */
   attachments?: NonNullable<RunServiceDeps['attachments']>
+  /** #782 沙箱 ensure 解析（rewindFiles 前置；server.ts 注入 sandboxes.lifecycle.ensure） */
+  ensureSandbox?: (sessionId: string) => Promise<{ containerId: string }>
   /** 插件运行时（#788；测试注入覆盖缺省目录装配——V1 目录为空时缺省装配即 no-op 面） */
   plugins?: PluginRuntime
 }): Promise<RunnerAssembly> {
@@ -105,6 +111,28 @@ export async function assembleRunner(opts: {
   // path 与持有者。覆盖 ingestion/校验节点 putArchive 写面——下方下载节点闭包内包装）。
   const writeLocks = new WriteLockRegistry({ timeoutMs: config.runner.writeLockTimeoutMs })
 
+  // 文件 rewind 机制（#782 · D8）：JournalingBackend 打点接缝 + ingestion/D9 物化打点 +
+  // rewind 逆放 + reconcile。journal sessionId 归属 parent（teammate 写共享 session-global
+  // 日志）——containerOf 面按 session id 直呼（teammate 调用方传 parent id）。
+  // 探在语义（null = 容器缺失/未运行）：reconcileOnBoot 的「容器缺失跳过」契约前提
+  // （inspect 只读，启动期不批量 ensure——restore 路兜底）。经 DockerPrimitives 单客户端
+  // inspectRunning（对齐 clientFactory 懒缓存先例——不裸 new Docker 双通道）。
+  const fileJournal = new FileJournalService({
+    prisma: opts.prisma,
+    primitives,
+    quotaBytes: config.runner.fileJournal.quotaBytes,
+    depthLimit: config.runner.fileJournal.depthLimit,
+    fenceTimeoutMs: config.runner.fileJournal.fenceTimeoutMs,
+    containerOf: async (sessionId) => {
+      const name = sandboxContainerName(sessionId)
+      return (await primitives.inspectRunning(name)) ? name : null
+    },
+    ...(opts.ensureSandbox
+      ? { ensureContainerOf: async (sessionId) => (await opts.ensureSandbox!(sessionId)).containerId }
+      : {}),
+    checkpointParentOf: async (sessionId) => loadCheckpointParentOf(opts.prisma, sessionId),
+  })
+
   // #780 下载校验节点（片 3）：file 写类工具（write/edit）成功后校验声明路径 → 物化
   // Attachment 行 + 下载引用追加进 tool 输出（tool.end details 承载）；失败 → 错误回喂
   // agent loop 重新生成。ownerId 按 session 解析（工具调用面无身份参数——ctx 身份纪律）。
@@ -137,7 +165,7 @@ export async function assembleRunner(opts: {
         },
         resolveContainer: async (threadId) => {
           const teammate = await opts.prisma.teammate.findUnique({ where: { threadId } })
-          return `${SANDBOX_CONTAINER_PREFIX}${teammate?.parentSessionId ?? threadId}`
+          return sandboxContainerName(teammate?.parentSessionId ?? threadId)
         },
         audit: (info) => {
           // eslint-disable-next-line no-console
@@ -180,6 +208,7 @@ export async function assembleRunner(opts: {
     writeLocks,
     attachments: opts.attachments,
     downloadNode,
+    fileJournal,
     plugins,
   })
   void service.recoverSuspensions() // 重启恢复：超时未落定的审批升级 → suspended（异步，不挂启动）
@@ -200,6 +229,7 @@ export async function assembleRunner(opts: {
     queue,
     registry,
     primitives,
+    fileJournal,
     plugins,
     close: async () => {
       service.dispose()

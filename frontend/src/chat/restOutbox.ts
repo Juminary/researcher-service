@@ -47,7 +47,9 @@ interface OutboxBlob {
   sessions: Record<string, OutboxEntry[]>
 }
 
-function randomClientKey(): string {
+// 32-hex 幂等 key 生成（sendSessionMessage Idempotency-Key 与 outbox clientKey 同源共用——
+// #793 接线：直发路径与断线排队路径共用同一 key 形态，重发必得 replay）。
+export function newClientKey(): string {
   const bytes = new Uint8Array(16)
   globalThis.crypto.getRandomValues(bytes)
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
@@ -108,7 +110,7 @@ export function createRestOutbox(storage: Storage | null = getSafeSessionStorage
   return {
     enqueue(sessionId, content, opts) {
       const entry: OutboxEntry = {
-        clientKey: opts?.idgen ? opts.idgen() : randomClientKey(),
+        clientKey: opts?.idgen ? opts.idgen() : newClientKey(),
         content,
         queuedAt: opts?.now ? opts.now() : Date.now(),
       }

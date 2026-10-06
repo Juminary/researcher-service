@@ -77,6 +77,8 @@ async function main(): Promise<void> {
     },
     // #780 附件 ingestion（片 2）：run 首步物化附件到沙箱 + 图片内联多模态。
     attachments: attachmentsService,
+    // #782 文件 rewind：rewindFiles 前置沙箱 ensure（stopped 复启/惰性创建——run 前同语义）。
+    ensureSandbox: (id) => sandboxes.lifecycle.ensure(id),
   })
   // 插件域 REST（#788）：编译期目录 + per-user 启用位（8xxxx 段）。
   const pluginsRouter = { prisma, manifests: PLUGIN_MANIFESTS }
@@ -97,6 +99,13 @@ async function main(): Promise<void> {
     },
     // #780 附件链接（≤4 件 + 归属/session 校验）——上传/下载走独立 AttachmentsService
     attachments: attachmentsService,
+    // #782 文件 rewind（D8）：逆放 + 预览 + 会话级互斥（FileJournalService 结构面）
+    fileRewind: {
+      rewindFiles: (p) => runner.fileJournal.rewindFiles(p),
+      rewindFilesCore: (p) => runner.fileJournal.rewindFilesCore(p),
+      runRewindExclusive: (sessionId, fn) => runner.fileJournal.runRewindExclusive(sessionId, fn),
+      preview: (p) => runner.fileJournal.preview(p),
+    },
   })
   runner.service.setRecordTurn((p) => sessions.recordTurn(p))
   // wiki 全量更新独立 run（#790 · 三通道③）：复用 runner 装配的 registry/primitives（#731
@@ -106,6 +115,21 @@ async function main(): Promise<void> {
     primitives: runner.primitives,
     hub: eventHub,
   })
+  // #782 启动 reconcile（roll-forward + 续放）：异步不挂启动；单 session 故障 Reconciler
+  // 内部 warn 不中断全批，容器缺失 session 跳过（rewindFiles 前置 restore 路兜底）；摘要
+  // 计数上行（观测面——静默不可接受）。
+  void runner.fileJournal
+    .reconcileOnBoot()
+    .then((outcomes) => {
+      if (outcomes.size === 0) return
+      const missing = [...outcomes.values()].filter((o) => o.containerMissing).length
+      // eslint-disable-next-line no-console
+      console.warn(`[filejournal] boot reconcile: sessions=${outcomes.size} containerMissing=${missing}`)
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[filejournal] boot reconcile crashed: ${String(err)}`)
+    })
   const app = createApp({
     prisma,
     orchestrator: fleet.orchestrator,

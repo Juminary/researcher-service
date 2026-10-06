@@ -8,9 +8,10 @@ import {
   createInstance,
   listInstances,
   removeInstance,
+  triggerPair,
   type InstanceDTO,
+  type PairingDTO,
 } from '@/api/containers'
-import { triggerPair, type PairingDTO } from '@/api/chat'
 import { ApiError } from '@/api/client'
 import { upgradeBadge, type UpgradeBadge } from '@/containers/upgradeGate'
 

@@ -10,7 +10,7 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
-  resolve: [approval: ApprovalItem, decision: 'allow-once' | 'deny']
+  resolve: [approval: ApprovalItem, decision: 'allow' | 'deny']
   toggleDetail: [approval: ApprovalItem]
 }>()
 </script>

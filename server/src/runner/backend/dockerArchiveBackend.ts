@@ -34,7 +34,7 @@ import type {
 } from './protocol'
 import type { ExecOutcome, SandboxFilePrimitives } from './primitives'
 import { routePath, type BackendTargets, type RouteResult } from './paths'
-import { getMimeType, isTextMimeType } from './mime'
+import { decodeWriteContent, getMimeType, isTextMimeType } from './mime'
 import { matchGlobBaseName, matchGlobPattern } from './globmatch'
 import { paginateReadLines, performStringReplacement } from './semantics'
 import {
@@ -56,6 +56,9 @@ interface ArchiveTree {
 
 // routePath 成功分支的命名形态（putBuffer 等内部通道参数；窄化即得）
 type RoutedPath = Extract<RouteResult, { container: string }>
+
+// guardedFile error 分类（not-found 单列——write 打点面的新建语义判据；其余 = 降级面）
+export type GuardedFileErrorKind = 'not-found' | 'is-directory' | 'symlink' | 'exceeds-limit'
 
 export class DockerArchiveBackend implements SandboxBackendProtocolV2 {
   readonly id: string
@@ -98,31 +101,40 @@ export class DockerArchiveBackend implements SandboxBackendProtocolV2 {
   }
 
   // ---- 内部：单文件读取守卫链（read/readRaw/readFullText 三处共用；评审 m3-m9 轮 Standards 收拢） ----
+  //（protected：#782 JournalingBackend 子类打点管线复用 pre-image 读取面）
 
   // null → not found；directory → is a directory；symlink → 显式拒绝；'other'（fifo 等）
   // → not found（镜像上游 stat !isFile——评审残留：旧代码落入 content 缺失误报超限）；
   // file 但 content 缺失 → exceeds read limit（>32MiB，评审 m7）。评审 m9(1)：目录文案
   // 「is a directory」系知情分歧——上游报 not found（stat !isFile），此处信息量更高。
-  private async guardedFile(routed: RoutedPath, filePath: string): Promise<{ tree: ArchiveTree; buf: Buffer } | { error: string }> {
+  // kind 结构化分类（#782：JournalingBackend.write 按 kind 分派 pre-image 处置——
+  // not-found = 新建语义，其余 = 降级面；文案匹配脆弱故随 error 结构化）。
+  protected async guardedFile(
+    routed: RoutedPath,
+    filePath: string,
+  ): Promise<{ tree: ArchiveTree; buf: Buffer } | { error: string; kind: GuardedFileErrorKind }> {
     const tree = await this.archiveRead(routed.container, routed.absPath, true)
-    if (tree === null) return { error: `File '${filePath}' not found` }
-    if (tree.root.type === 'directory') return { error: `is a directory: ${filePath}` }
-    if (tree.root.type === 'symlink') return { error: `Symlinks are not allowed: ${filePath}` }
-    if (tree.root.type !== 'file') return { error: `File '${filePath}' not found` }
+    if (tree === null) return { error: `File '${filePath}' not found`, kind: 'not-found' }
+    if (tree.root.type === 'directory') return { error: `is a directory: ${filePath}`, kind: 'is-directory' }
+    if (tree.root.type === 'symlink') return { error: `Symlinks are not allowed: ${filePath}`, kind: 'symlink' }
+    if (tree.root.type !== 'file') return { error: `File '${filePath}' not found`, kind: 'not-found' }
     const buf = tree.content.get(routed.absPath)
-    if (buf === undefined) return { error: `File '${filePath}' exceeds read limit (${MAX_COLLECT_BYTES} bytes)` }
+    if (buf === undefined) {
+      return { error: `File '${filePath}' exceeds read limit (${MAX_COLLECT_BYTES} bytes)`, kind: 'exceeds-limit' }
+    }
     return { tree, buf }
   }
 
   // ---- 内部：read 全量文本（edit 合成用；守卫链见 guardedFile；分页走 paginateReadLines） ----
 
-  private async readFullText(routed: RoutedPath, filePath: string): Promise<{ text: string } | { error: string }> {
+  protected async readFullText(routed: RoutedPath, filePath: string): Promise<{ text: string } | { error: string }> {
     const g = await this.guardedFile(routed, filePath)
     if ('error' in g) return g
     return { text: g.buf.toString('utf8') }
   }
 
   // ---- 内部：mkdir -p 父目录 + putArchive 单文件落盘（write/edit 共用通道） ----
+  //（protected：#782 JournalingBackend 子类打点管线复用 apply 通道——幂等重放同路径）
 
   // edit 必须走本通道而非 write()：write 对二进制 mime 做 base64 解码，而 edit 读侧按
   // utf8 全文本（readFullText）——错名二进制扩展名（.png 实为文本）经 write() 写回会把
@@ -130,7 +142,7 @@ export class DockerArchiveBackend implements SandboxBackendProtocolV2 {
   // symlink 语义（评审 m8 跟进探针亲验）：上游 fs.writeFile 穿透 symlink 写目标；本通道
   // 经 daemon untar 对链目的端是「替换链本身」（真 daemon 实测：目标字节不变、链变常规
   // 文件）——不穿透故不会越界写链指目标，安全面不劣于上游。
-  private async putBuffer(routed: RoutedPath, buf: Buffer): Promise<void> {
+  protected async putBuffer(routed: RoutedPath, buf: Buffer): Promise<void> {
     const abs = routed.absPath
     const dir = abs.slice(0, abs.lastIndexOf('/')) || '/'
     const basename = abs.split('/').pop() ?? 'file'
@@ -225,9 +237,7 @@ export class DockerArchiveBackend implements SandboxBackendProtocolV2 {
     try {
       const routed = routePath(filePath, this.targets)
       if ('error' in routed) return { error: routed.error }
-      // 二进制 mime：content 为 base64（对齐官方 FilesystemBackend 的 write 分支）
-      const buf = isTextMimeType(getMimeType(filePath)) ? Buffer.from(content, 'utf8') : Buffer.from(content, 'base64')
-      await this.putBuffer(routed, buf)
+      await this.putBuffer(routed, decodeWriteContent(filePath, content))
       return { path: routed.absPath, filesUpdate: null }
     } catch (e) {
       return { error: `write failed: ${String(e)}` }
